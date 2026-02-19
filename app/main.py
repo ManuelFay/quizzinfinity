@@ -53,13 +53,22 @@ _generation_jobs: dict[str, GenerationJob] = {}
 _generation_jobs_lock = threading.Lock()
 
 
-def _track_progress(job: GenerationJob, *, stage: str, generated: int | None = None, verified: int | None = None):
+def _track_progress(
+    job: GenerationJob,
+    *,
+    stage: str,
+    generated: int | None = None,
+    verified: int | None = None,
+    total: int | None = None,
+):
     with job.lock:
         job.stage = stage
         if generated is not None:
             job.generated_questions = generated
         if verified is not None:
             job.verified_questions = verified
+        if total is not None:
+            job.total_questions = total
 
 
 def _resolve_followup_context(payload: GenerateQuizRequest, db: Session):
@@ -175,6 +184,7 @@ def _run_generation_job(job_id: str):
                 job,
                 stage=f"Generating questions ({generated}/{total})",
                 generated=generated,
+                total=total,
             ),
         )
 

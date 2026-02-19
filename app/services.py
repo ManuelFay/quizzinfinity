@@ -4,6 +4,7 @@ import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Callable, List
 
 from openai import AuthenticationError, OpenAI
@@ -22,6 +23,13 @@ class GenerationPlan:
     prompt: str
     difficulty: int
     difficulty_rationale: str
+
+
+@dataclass
+class CategoryPlan:
+    name: str
+    focus: str
+    question_target: int
 
 
 class LLMQuizService:
@@ -112,27 +120,43 @@ class LLMQuizService:
         )
 
         tools = [{"type": "web_search_preview"}] if use_web_search else []
-        chunk_size = 5
+        over_generate_count = question_count + max(2, math.ceil(question_count * 0.25))
         all_questions: List[QuestionPayload] = []
-        total = question_count
-        chunk_count = math.ceil(question_count / chunk_size)
+        total = over_generate_count
 
         logger.info(
-            "Generating quiz via OpenAI in %s chunks (topic=%r, difficulty=%s, question_count=%s)",
-            chunk_count,
+            "Generating quiz via OpenAI with planning (topic=%r, difficulty=%s, requested=%s, over_generate=%s)",
             topic,
             plan.difficulty,
             question_count,
+            over_generate_count,
         )
 
-        for chunk_index in range(chunk_count):
+        categories = self._plan_categories(
+            plan=plan,
+            topic=topic,
+            learning_goal=learning_goal,
+            target_count=over_generate_count,
+            weak_categories=weak_categories or [],
+            flagged_prompts=flagged_prompts or [],
+            custom_instructions=custom_instructions,
+            tools=tools,
+        )
+        logger.info("Question category plan: %s", [c.__dict__ for c in categories])
+
+        for category in categories:
             remaining = total - len(all_questions)
-            request_count = min(chunk_size, remaining)
+            request_count = min(category.question_target, remaining)
+            if request_count <= 0:
+                break
+
+            seen_prompts = [q.prompt for q in all_questions]
             prompt = (
-                f"{plan.prompt} Question count: {request_count}. "
-                "Ensure categories are meaningful and varied where possible. "
-                f"Chunk {chunk_index + 1} of {chunk_count}. "
-                "Do not repeat prior prompts exactly."
+                f"{plan.prompt} "
+                f"Category focus: {category.name} ({category.focus}). "
+                f"Generate {request_count} questions for this category only. "
+                "Ensure questions are conceptually distinct and avoid overlap with each other. "
+                f"Already generated prompts to avoid repeating or paraphrasing:\n{json.dumps(seen_prompts)}"
             )
 
             response_text = self._generate_chunk_with_retry(prompt, tools)
@@ -147,9 +171,82 @@ class LLMQuizService:
             if progress_callback:
                 progress_callback(len(all_questions), total)
 
-        return all_questions[:question_count], plan
+        deduped_questions = self._deduplicate_questions(all_questions)
+        final_questions = deduped_questions[:question_count]
+        logger.info(
+            "Generated %s raw questions, %s after dedupe, returning %s",
+            len(all_questions),
+            len(deduped_questions),
+            len(final_questions),
+        )
+
+        return final_questions, plan
+
+    def _plan_categories(
+        self,
+        *,
+        plan: GenerationPlan,
+        topic: str,
+        learning_goal: str,
+        target_count: int,
+        weak_categories: List[str],
+        flagged_prompts: List[str],
+        custom_instructions: str,
+        tools,
+    ) -> List[CategoryPlan]:
+        planner_prompt = (
+            "Plan a diverse quiz blueprint and return JSON only in the form "
+            "{'categories':[{'name':str,'focus':str,'question_target':int}]}. "
+            "Use 4-6 categories with materially different focus areas. "
+            f"Total planned question_target must sum to {target_count}. "
+            f"Topic: {topic}. Learning goal: {learning_goal}. Difficulty: {plan.difficulty}. "
+            f"Weak categories to cover: {weak_categories}. Flagged prompts: {flagged_prompts}. "
+            f"Additional instructions: {custom_instructions or 'none'}."
+        )
+        logger.info("Prompt sent to gpt-5 (planner): %s", planner_prompt)
+        response = self.client.responses.create(model="gpt-5", input=planner_prompt, tools=tools)
+        payload = self._extract_json(response.output_text or "")
+        raw_categories = payload.get("categories") or []
+
+        categories = [
+            CategoryPlan(
+                name=str(item.get("name", "General")).strip() or "General",
+                focus=str(item.get("focus", "Core concepts")).strip() or "Core concepts",
+                question_target=max(1, int(item.get("question_target", 1))),
+            )
+            for item in raw_categories
+        ]
+        if not categories:
+            return [CategoryPlan(name="General", focus="Core concepts", question_target=target_count)]
+
+        return self._rebalance_targets(categories, target_count)
+
+    @staticmethod
+    def _rebalance_targets(categories: List[CategoryPlan], target_count: int) -> List[CategoryPlan]:
+        current = sum(c.question_target for c in categories)
+        if current == target_count:
+            return categories
+
+        if current < target_count:
+            idx = 0
+            while current < target_count:
+                categories[idx % len(categories)].question_target += 1
+                current += 1
+                idx += 1
+            return categories
+
+        categories = sorted(categories, key=lambda c: c.question_target, reverse=True)
+        idx = 0
+        while current > target_count and any(c.question_target > 1 for c in categories):
+            candidate = categories[idx % len(categories)]
+            if candidate.question_target > 1:
+                candidate.question_target -= 1
+                current -= 1
+            idx += 1
+        return categories
 
     def _generate_chunk_with_retry(self, prompt: str, tools):
+        logger.info("Prompt sent to gpt-5 (question generation): %s", prompt)
         try:
             response = self.client.responses.create(model="gpt-5", input=prompt, tools=tools)
         except AuthenticationError as exc:
@@ -233,6 +330,23 @@ class LLMQuizService:
                 raise QuestionGenerationError("Question has invalid correct option index")
             if not q.category.strip() or not q.explanation.strip():
                 raise QuestionGenerationError("Question missing category or explanation")
+
+    @staticmethod
+    def _deduplicate_questions(questions: List[QuestionPayload]) -> List[QuestionPayload]:
+        deduped: List[QuestionPayload] = []
+        normalized_prompts: List[str] = []
+        for question in questions:
+            normalized = " ".join(question.prompt.lower().split())
+            is_duplicate = False
+            for existing in normalized_prompts:
+                if normalized == existing or SequenceMatcher(None, normalized, existing).ratio() >= 0.9:
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+            normalized_prompts.append(normalized)
+            deduped.append(question)
+        return deduped
 
 
 def compute_analysis(question_rows, answer_rows):
