@@ -137,6 +137,29 @@ def test_attempt_fetch_and_study_plan_update(monkeypatch):
     assert get_attempt.json()["attempt_id"] == attempt_id
 
 
+def test_partial_submit_persists_unanswered_questions(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    gen_start = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "statistics", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    gen = wait_for_job(client, gen_start.json()["job_id"])
+
+    partial_answers = [
+        {"question_id": gen["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False}
+    ]
+    sub = client.post(f"/api/quizzes/{gen['quiz_id']}/submit", json={"answers": partial_answers})
+    assert sub.status_code == 200
+    payload = sub.json()
+
+    assert payload["total"] == 2
+    unanswered = [row for row in payload["question_results"] if row["selected_option_index"] is None]
+    assert len(unanswered) == 1
+    assert unanswered[0]["is_correct"] is None
+
+
 def test_dataset_export_and_import(monkeypatch):
     monkeypatch.setattr("app.main.service", MockService())
     client = TestClient(app)
@@ -149,7 +172,6 @@ def test_dataset_export_and_import(monkeypatch):
 
     answers = [
         {"question_id": gen["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
-        {"question_id": gen["questions"][1]["id"], "selected_option_index": 2, "flagged_for_review": True},
     ]
     submit = client.post(f"/api/quizzes/{gen['quiz_id']}/submit", json={"answers": answers})
     assert submit.status_code == 200
@@ -159,6 +181,7 @@ def test_dataset_export_and_import(monkeypatch):
     exported = export_res.json()
     assert exported['format_version'] == '1.0'
     assert len(exported['quizzes']) >= 1
+    assert any(answer['selected_option_index'] is None for quiz in exported['quizzes'] for attempt in quiz['attempts'] for answer in attempt['answers'])
 
     import_payload = {
         'quizzes': [

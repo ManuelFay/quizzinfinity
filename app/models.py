@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -58,8 +59,8 @@ class AttemptAnswer(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     attempt_id: Mapped[int] = mapped_column(ForeignKey("attempts.id"), index=True)
     question_id: Mapped[int] = mapped_column(ForeignKey("questions.id"), index=True)
-    selected_option_index: Mapped[int] = mapped_column(Integer)
-    is_correct: Mapped[bool] = mapped_column(Boolean)
+    selected_option_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_correct: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     flagged_for_review: Mapped[bool] = mapped_column(Boolean, default=False)
 
     attempt = relationship("Attempt", back_populates="answers")

@@ -614,7 +614,7 @@ def compute_analysis(question_rows, answer_rows):
         question = question_lookup[answer.question_id]
         category = question.category
         by_category[category]["total"] += 1
-        by_category[category]["correct"] += int(answer.is_correct)
+        by_category[category]["correct"] += int(bool(answer.is_correct))
         by_category[category]["flagged"] += int(answer.flagged_for_review)
 
         question_results.append(

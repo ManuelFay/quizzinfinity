@@ -358,8 +358,11 @@ def submit_quiz(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(
 
     question_ids = {q.id for q in questions}
     answers_by_qid = {a.question_id: a for a in payload.answers}
-    if question_ids != set(answers_by_qid.keys()):
-        raise HTTPException(status_code=400, detail="All questions must be answered exactly once")
+    if len(answers_by_qid) != len(payload.answers):
+        raise HTTPException(status_code=400, detail="Each question can only be submitted once")
+    unknown_ids = set(answers_by_qid.keys()) - question_ids
+    if unknown_ids:
+        raise HTTPException(status_code=400, detail="Submission includes unknown question_id values")
 
     score = 0
     attempt = Attempt(quiz_id=quiz_id, score=0, total=len(questions), percentage=0)
@@ -367,16 +370,17 @@ def submit_quiz(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(
     db.flush()
 
     for q in questions:
-        answer = answers_by_qid[q.id]
-        is_correct = answer.selected_option_index == q.correct_option_index
-        score += int(is_correct)
+        answer = answers_by_qid.get(q.id)
+        selected_option_index = answer.selected_option_index if answer else None
+        is_correct = selected_option_index == q.correct_option_index if selected_option_index is not None else None
+        score += int(bool(is_correct))
         db.add(
             AttemptAnswer(
                 attempt_id=attempt.id,
                 question_id=q.id,
-                selected_option_index=answer.selected_option_index,
+                selected_option_index=selected_option_index,
                 is_correct=is_correct,
-                flagged_for_review=answer.flagged_for_review,
+                flagged_for_review=answer.flagged_for_review if answer else False,
             )
         )
 
@@ -453,7 +457,7 @@ def get_historical_stats(db: Session = Depends(get_db)):
     attempt_by_id = {attempt.id: attempt for attempt in attempts}
 
     total_answers = len(answers)
-    correct_answers = sum(1 for answer in answers if answer.is_correct)
+    correct_answers = sum(1 for answer in answers if answer.is_correct is True)
     global_accuracy = round((correct_answers / total_answers) * 100, 2) if total_answers else 0.0
 
     category_bucket: dict[str, dict[str, int]] = {}
@@ -466,13 +470,17 @@ def get_historical_stats(db: Session = Depends(get_db)):
 
         stats = category_bucket.setdefault(question.category, {"correct": 0, "total": 0})
         stats["total"] += 1
-        stats["correct"] += int(answer.is_correct)
+        stats["correct"] += int(answer.is_correct is True)
 
         if answer.is_correct:
             continue
 
         options = json.loads(question.options_json)
-        selected_text = options[answer.selected_option_index] if 0 <= answer.selected_option_index < len(options) else ""
+        selected_text = (
+            options[answer.selected_option_index]
+            if answer.selected_option_index is not None and 0 <= answer.selected_option_index < len(options)
+            else ""
+        )
         correct_text = options[question.correct_option_index] if 0 <= question.correct_option_index < len(options) else ""
         attempt = attempt_by_id.get(answer.attempt_id)
         quiz = quiz_by_id.get(attempt.quiz_id) if attempt else None
@@ -637,9 +645,13 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                 is_correct = (
                     incoming_answer.is_correct
                     if incoming_answer.is_correct is not None
-                    else incoming_answer.selected_option_index == mapped_question.correct_option_index
+                    else (
+                        incoming_answer.selected_option_index == mapped_question.correct_option_index
+                        if incoming_answer.selected_option_index is not None
+                        else None
+                    )
                 )
-                correct_counter += int(is_correct)
+                correct_counter += int(bool(is_correct))
                 db.add(
                     AttemptAnswer(
                         attempt_id=attempt.id,

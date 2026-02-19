@@ -63,7 +63,7 @@ class QuizGenerationJobStatus(BaseModel):
 
 class AnswerIn(BaseModel):
     question_id: int
-    selected_option_index: int = Field(ge=0, le=3)
+    selected_option_index: Optional[int] = Field(default=None, ge=0, le=3)
     flagged_for_review: bool = False
 
 
@@ -90,9 +90,9 @@ class QuestionResultOut(BaseModel):
     question_id: int
     prompt: str
     category: str
-    selected_option_index: int
+    selected_option_index: Optional[int]
     correct_option_index: int
-    is_correct: bool
+    is_correct: Optional[bool]
     flagged_for_review: bool
     explanation: str
     options: List[str]
@@ -123,7 +123,7 @@ class MissedQuestionStatOut(BaseModel):
     prompt: str
     category: str
     quiz_topic: str
-    selected_option_index: int
+    selected_option_index: Optional[int]
     selected_option_text: str
     correct_option_index: int
     correct_option_text: str
@@ -152,8 +152,8 @@ class HistoricalStatsResponse(BaseModel):
 
 class ExportAttemptAnswerOut(BaseModel):
     question_position: int
-    selected_option_index: int
-    is_correct: bool
+    selected_option_index: Optional[int]
+    is_correct: Optional[bool]
     flagged_for_review: bool
 
 
@@ -192,7 +192,7 @@ class DatasetExportResponse(BaseModel):
 
 class ImportAttemptAnswerIn(BaseModel):
     question_position: int = Field(ge=1)
-    selected_option_index: int = Field(ge=0, le=3)
+    selected_option_index: Optional[int] = Field(default=None, ge=0, le=3)
     is_correct: Optional[bool] = None
     flagged_for_review: bool = False
 
