@@ -15,8 +15,8 @@ class MockService:
     def generate_questions(self, **kwargs):
         progress_callback = kwargs.get("progress_callback")
         if progress_callback:
-            progress_callback(1, kwargs.get("question_count", 2))
-            progress_callback(2, kwargs.get("question_count", 2))
+            progress_callback(1, kwargs.get("question_count", 2), "Completed category: Foundations")
+            progress_callback(2, kwargs.get("question_count", 2), "Completed category: Applied Practice")
 
         class Plan:
             prompt = "mock prompt"
@@ -221,6 +221,32 @@ def test_dataset_export_and_import(monkeypatch):
     assert imported['imported_attempts'] == 1
     assert imported['imported_answers'] == 1
 
+
+
+
+def test_generation_status_exposes_stage_details_and_category_progress(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    start = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "machine learning", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    assert start.status_code == 200
+
+    payload = None
+    for _ in range(30):
+        status = client.get(f"/api/quizzes/generate/{start.json()['job_id']}")
+        assert status.status_code == 200
+        payload = status.json()
+        assert "stage_detail" in payload
+        assert "category_progress" in payload
+        if payload["state"] in {"completed", "failed"}:
+            break
+        time.sleep(0.02)
+
+    assert payload is not None
+    assert isinstance(payload["category_progress"], list)
 
 def test_historical_stats_endpoint(monkeypatch):
     monkeypatch.setattr("app.main.service", MockService())

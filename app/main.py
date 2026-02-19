@@ -61,6 +61,8 @@ class GenerationJob:
     generated_questions: int = 0
     verified_questions: int = 0
     total_questions: int = 0
+    stage_detail: str = ""
+    category_progress: list[str] = field(default_factory=list)
     error: str = ""
     result: GenerateQuizResponse | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -77,6 +79,8 @@ def _track_progress(
     generated: int | None = None,
     verified: int | None = None,
     total: int | None = None,
+    stage_detail: str | None = None,
+    category_event: str | None = None,
 ):
     with job.lock:
         job.stage = stage
@@ -86,6 +90,10 @@ def _track_progress(
             job.verified_questions = verified
         if total is not None:
             job.total_questions = total
+        if stage_detail is not None:
+            job.stage_detail = stage_detail
+        if category_event:
+            job.category_progress = [category_event, *job.category_progress][:4]
 
 
 
@@ -201,6 +209,7 @@ def _run_generation_job(job_id: str):
     with job.lock:
         job.state = "running"
         job.stage = "Resolving follow-up context"
+        job.stage_detail = "Collecting prior attempts, weak categories, and flagged prompts"
 
     db = next(get_db())
     try:
@@ -215,7 +224,13 @@ def _run_generation_job(job_id: str):
             prior_attempt_percentage,
         )
 
-        _track_progress(job, stage="Generating question chunks", generated=0, verified=0)
+        _track_progress(
+            job,
+            stage="Generating question chunks",
+            generated=0,
+            verified=0,
+            stage_detail="Planning category mix and starting parallel generation",
+        )
         questions, plan = service.generate_questions(
             topic=cleaned_payload.topic,
             learning_goal=cleaned_payload.learning_goal,
@@ -227,15 +242,22 @@ def _run_generation_job(job_id: str):
             prior_attempt_percentage=prior_attempt_percentage,
             custom_instructions=cleaned_payload.custom_instructions,
             existing_questions=existing_questions,
-            progress_callback=lambda generated, total: _track_progress(
+            progress_callback=lambda generated, total, category_event="": _track_progress(
                 job,
                 stage=f"Generating questions ({generated}/{total})",
                 generated=generated,
                 total=total,
+                stage_detail="Generating category batches in parallel",
+                category_event=category_event,
             ),
         )
 
-        _track_progress(job, stage="Verifying generated questions", verified=0)
+        _track_progress(
+            job,
+            stage="Verifying generated questions",
+            verified=0,
+            stage_detail="Checking answer validity and explanation quality",
+        )
         if hasattr(service, "rebalance_questions_for_option_lengths"):
             questions = service.rebalance_questions_for_option_lengths(
                 questions,
@@ -244,6 +266,7 @@ def _run_generation_job(job_id: str):
                     stage=f"Balancing option lengths ({fixed}/{total})",
                     verified=fixed,
                     total=total,
+                    stage_detail="Normalizing option lengths for fairer multiple choice",
                 ),
             )
         verification = service.verify_questions(
@@ -252,6 +275,7 @@ def _run_generation_job(job_id: str):
                 job,
                 stage=f"Verifying questions ({checked}/{total})",
                 verified=checked,
+                stage_detail="Running strict schema and quality verification",
             ),
         )
         if verification.is_valid:
@@ -291,6 +315,7 @@ def _run_generation_job(job_id: str):
                         stage=f"Filtering questions ({completed}/{total_questions})",
                         verified=completed,
                         total=total_questions,
+                        stage_detail="Repairing or dropping questions that failed validation",
                     )
                     if status == "repaired":
                         logger.info("Repaired question %s after verification failure", idx + 1)
@@ -301,7 +326,7 @@ def _run_generation_job(job_id: str):
                     "Verification failed for all questions: " + "; ".join(verification.reasons)
                 )
 
-        _track_progress(job, stage="Persisting quiz")
+        _track_progress(job, stage="Persisting quiz", stage_detail="Saving quiz and question records")
         result = _persist_quiz(db, cleaned_payload, verified_questions, plan)
 
         with job.lock:
@@ -310,6 +335,7 @@ def _run_generation_job(job_id: str):
             job.generated_questions = len(questions)
             job.verified_questions = len(verified_questions)
             job.stage = "Completed"
+            job.stage_detail = "Quiz is ready"
             job.state = "completed"
         logger.info("Quiz generation job %s completed with %s questions", job_id, len(questions))
     except QuestionGenerationError as exc:
@@ -317,11 +343,13 @@ def _run_generation_job(job_id: str):
             job.state = "failed"
             job.error = str(exc)
             job.stage = "Failed"
+            job.stage_detail = "Generation job failed"
     except Exception as exc:  # noqa: BLE001
         with job.lock:
             job.state = "failed"
             job.error = f"Quiz generation failed: {exc}"
             job.stage = "Failed"
+            job.stage_detail = "Generation job failed"
     finally:
         db.close()
 
@@ -370,6 +398,8 @@ def get_generation_job_status(job_id: str):
             "generated_questions": job.generated_questions,
             "verified_questions": job.verified_questions,
             "total_questions": job.total_questions,
+            "stage_detail": job.stage_detail,
+            "category_progress": job.category_progress,
             "error": job.error,
             "result": job.result,
         }

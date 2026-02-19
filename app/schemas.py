@@ -59,6 +59,8 @@ class QuizGenerationJobStatus(BaseModel):
     generated_questions: int = 0
     verified_questions: int = 0
     total_questions: int = 0
+    stage_detail: str = ""
+    category_progress: List[str] = Field(default_factory=list)
     error: str = ""
     result: Optional[GenerateQuizResponse] = None
 
