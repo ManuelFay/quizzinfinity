@@ -1,0 +1,109 @@
+from fastapi.testclient import TestClient
+
+from app.database import Base, engine
+from app.main import app
+from app.schemas import QuestionPayload, VerificationResult
+
+
+class MockService:
+    def generate_questions(self, **kwargs):
+        return [
+            QuestionPayload(
+                prompt="What does Bayes theorem compute?",
+                options=[
+                    "Derivative of a product",
+                    "Posterior probability from prior and likelihood",
+                    "Mean absolute error",
+                    "Taylor approximation",
+                ],
+                correct_option_index=1,
+                category="probability",
+                explanation="Bayes theorem updates belief using observed evidence.",
+            ),
+            QuestionPayload(
+                prompt="Which method is best for high-bias underfit linear model?",
+                options=["More features", "More regularization", "Smaller dataset", "Early stopping only"],
+                correct_option_index=0,
+                category="ml-modeling",
+                explanation="Adding relevant features can reduce underfitting bias.",
+            ),
+        ]
+
+    def verify_questions(self, questions):
+        return VerificationResult(is_valid=True, reasons=[])
+
+
+def setup_module():
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+
+def test_generate_and_submit_quiz(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    gen = client.post(
+        "/api/quizzes/generate",
+        json={
+            "topic": "machine learning",
+            "learning_goal": "",
+            "difficulty": 8,
+            "question_count": 5,
+            "use_web_search": False,
+        },
+    )
+    assert gen.status_code == 200
+    data = gen.json()
+    assert data["quiz_id"] > 0
+    assert len(data["questions"]) == 2
+    assert "correct_option_index" in data["questions"][0]
+
+    answers = [
+        {"question_id": data["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
+        {"question_id": data["questions"][1]["id"], "selected_option_index": 2, "flagged_for_review": True},
+    ]
+    sub = client.post(f"/api/quizzes/{data['quiz_id']}/submit", json={"answers": answers})
+    assert sub.status_code == 200
+    payload = sub.json()
+    assert payload["score"] == 1
+    assert payload["total"] == 2
+    assert len(payload["category_summary"]) == 2
+    assert len(payload["study_topics"]) == 2
+    assert any(x["flagged_for_review"] for x in payload["question_results"])
+
+
+def test_attempt_fetch_and_study_plan_update(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    gen = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "statistics", "learning_goal": "", "difficulty": 7, "question_count": 5},
+    ).json()
+
+    answers = [
+        {"question_id": gen["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
+        {"question_id": gen["questions"][1]["id"], "selected_option_index": 1, "flagged_for_review": True},
+    ]
+    sub = client.post(f"/api/quizzes/{gen['quiz_id']}/submit", json={"answers": answers}).json()
+    attempt_id = sub["attempt_id"]
+
+    update = client.post(
+        f"/api/attempts/{attempt_id}/study-plan",
+        json={"topics": [{"topic": "custom weak topic", "priority": 1}, {"topic": "probability", "priority": 2}]},
+    )
+    assert update.status_code == 200
+    updated = update.json()
+    assert updated["study_topics"][0]["topic"] == "custom weak topic"
+    assert updated["study_topics"][0]["source"] == "user"
+
+    get_attempt = client.get(f"/api/attempts/{attempt_id}")
+    assert get_attempt.status_code == 200
+    assert get_attempt.json()["attempt_id"] == attempt_id
+
+
+def test_health_endpoint():
+    client = TestClient(app)
+    health = client.get("/api/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
