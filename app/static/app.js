@@ -28,6 +28,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [loadingStage, setLoadingStage] = useState('Queued');
   const [progressPct, setProgressPct] = useState(0);
+  const [progressMeta, setProgressMeta] = useState('Waiting for worker...');
   const [error, setError] = useState('');
   const [quiz, setQuiz] = useState(null);
   const [answers, setAnswers] = useState({});
@@ -53,22 +54,36 @@ function App() {
       const status = statusParsed.data;
       setLoadingStage(status.stage || 'Working');
 
-      const total = status.total_questions || questionCount;
-      let pct = 5;
-      if ((status.generated_questions || 0) > 0) {
-        pct = Math.max(pct, 10 + Math.round((status.generated_questions / total) * 55));
+      const total = Math.max(status.total_questions || questionCount, 1);
+      const generated = Math.min(status.generated_questions || 0, total);
+      const verified = Math.min(status.verified_questions || 0, total);
+
+      let pct = 4;
+      if (status.stage?.toLowerCase().includes('resolving')) pct = 8;
+      if (status.stage?.toLowerCase().includes('generating')) {
+        pct = Math.max(pct, 12 + Math.round((generated / total) * 58));
+        setProgressMeta(`Generated ${generated}/${total} questions`);
       }
-      if ((status.verified_questions || 0) > 0) {
-        pct = Math.max(pct, 65 + Math.round((status.verified_questions / total) * 30));
+      if (status.stage?.toLowerCase().includes('verifying')) {
+        pct = Math.max(pct, 72 + Math.round((verified / total) * 24));
+        setProgressMeta(`Verified ${verified}/${total} questions`);
+      }
+      if (status.stage?.toLowerCase().includes('persisting')) {
+        pct = Math.max(pct, 97);
+        setProgressMeta('Saving quiz to local database');
       }
       if (status.state === 'completed') {
         setProgressPct(100);
+        setProgressMeta('Done');
         return status.result;
       }
       if (status.state === 'failed') {
         throw new Error(status.error || 'Generation failed');
       }
-      setProgressPct(Math.min(pct, 95));
+      if (!status.stage?.toLowerCase().includes('generating') && !status.stage?.toLowerCase().includes('verifying') && !status.stage?.toLowerCase().includes('persisting')) {
+        setProgressMeta(status.stage || 'Working');
+      }
+      setProgressPct(Math.min(pct, 99));
       await new Promise((resolve) => setTimeout(resolve, 700));
     }
   }
@@ -77,6 +92,7 @@ function App() {
     setLoading(true);
     setLoadingStage('Creating generation job');
     setProgressPct(2);
+    setProgressMeta('Submitting generation request');
     setError('');
     setResult(null);
     setQuiz(null);
@@ -103,6 +119,7 @@ function App() {
       setQuiz(generatedQuiz);
       setIdx(0);
       setProgressPct(100);
+      setProgressMeta('Done');
     } catch (e) {
       setError(e.message);
     } finally {
@@ -175,8 +192,11 @@ function App() {
           {loading && (
             <div className="progress-card">
               <div className="small">{loadingStage}</div>
+              <div className="small">{progressMeta}</div>
               <div className="progress-track">
-                <div className="progress-fill" style={{ width: `${progressPct}%` }} />
+                <div className="progress-fill" style={{ width: `${progressPct}%` }}>
+                  <span>{progressPct}%</span>
+                </div>
               </div>
             </div>
           )}
