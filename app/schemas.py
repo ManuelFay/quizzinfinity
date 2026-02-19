@@ -242,6 +242,12 @@ class DatasetImportResponse(BaseModel):
     imported_answers: int
 
 
+class ResetStatsResponse(BaseModel):
+    deleted_attempts: int
+    deleted_answers: int
+    deleted_study_topics: int
+
+
 class VerificationResult(BaseModel):
     is_valid: bool
     reasons: List[str] = Field(default_factory=list)

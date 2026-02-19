@@ -24,6 +24,7 @@ from app.schemas import (
     GenerateQuizResponse,
     HistoricalStatsResponse,
     QuizGenerationJobResponse,
+    ResetStatsResponse,
     QuizGenerationJobStatus,
     StudyPlanUpdateRequest,
     SubmitQuizRequest,
@@ -583,6 +584,27 @@ def _isoformat(dt: datetime | None) -> str:
     if not dt:
         return ""
     return dt.isoformat()
+
+
+@app.post("/api/stats/reset", response_model=ResetStatsResponse)
+def reset_user_stats(db: Session = Depends(get_db)):
+    answer_count = db.query(AttemptAnswer).count()
+    study_topic_count = db.query(StudyTopic).count()
+    attempt_count = db.query(Attempt).count()
+
+    if answer_count:
+        db.query(AttemptAnswer).delete(synchronize_session=False)
+    if study_topic_count:
+        db.query(StudyTopic).delete(synchronize_session=False)
+    if attempt_count:
+        db.query(Attempt).delete(synchronize_session=False)
+    db.commit()
+
+    return {
+        "deleted_attempts": attempt_count,
+        "deleted_answers": answer_count,
+        "deleted_study_topics": study_topic_count,
+    }
 
 
 @app.get("/api/dataset/export", response_model=DatasetExportResponse)

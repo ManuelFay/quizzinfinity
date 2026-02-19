@@ -248,6 +248,44 @@ def test_generation_status_exposes_stage_details_and_category_progress(monkeypat
     assert payload is not None
     assert isinstance(payload["category_progress"], list)
 
+
+def test_reset_user_stats_clears_attempts_but_keeps_quizzes(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    gen_start = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "machine learning", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    gen = wait_for_job(client, gen_start.json()["job_id"])
+
+    answers = [
+        {"question_id": gen["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
+        {"question_id": gen["questions"][1]["id"], "selected_option_index": 2, "flagged_for_review": True},
+    ]
+    sub = client.post(f"/api/quizzes/{gen['quiz_id']}/submit", json={"answers": answers})
+    assert sub.status_code == 200
+
+    reset = client.post('/api/stats/reset')
+    assert reset.status_code == 200
+    payload = reset.json()
+    assert payload['deleted_attempts'] >= 1
+    assert payload['deleted_answers'] >= 2
+    assert payload['deleted_study_topics'] >= 1
+
+    history = client.get('/api/stats/history')
+    assert history.status_code == 200
+    history_payload = history.json()
+    assert history_payload['global_stats']['attempts'] == 0
+    assert history_payload['global_stats']['questions_answered'] == 0
+
+    exported = client.get('/api/dataset/export')
+    assert exported.status_code == 200
+    quizzes = exported.json()['quizzes']
+    assert len(quizzes) >= 1
+    assert all(isinstance(q['questions'], list) and q['questions'] for q in quizzes)
+
+
 def test_historical_stats_endpoint(monkeypatch):
     monkeypatch.setattr("app.main.service", MockService())
     client = TestClient(app)

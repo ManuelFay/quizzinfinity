@@ -209,6 +209,29 @@ function App() {
     }
   }
 
+
+  async function resetUserStats() {
+    if (!confirm('Clear all user history and stats? This removes past attempts and study priorities, but keeps quizzes and questions.')) {
+      return;
+    }
+
+    setError('');
+    try {
+      await fetchJsonOrThrow(
+        '/api/stats/reset',
+        { method: 'POST' },
+        'Failed to reset user stats',
+      );
+      setResult(null);
+      setStudyTopics([]);
+      setHistoryStats(null);
+      setShowHistoryModal(false);
+      alert('User stats reset complete.');
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
   async function openHistoricalStats() {
     setHistoryLoading(true);
     setError('');
@@ -323,6 +346,7 @@ function App() {
           <button disabled={loading} onClick={() => generateQuiz()}>{loading ? 'Generating...' : 'Generate Diagnostic Quiz'}</button>
           <button onClick={exportDataset}>Export Dataset (JSON)</button>
           <button onClick={triggerImportDataset}>Import Dataset (JSON)</button>
+          <button onClick={resetUserStats}>Reset User Stats</button>
           <input ref={fileInputRef} type="file" accept="application/json" style={{ display: 'none' }} onChange={importDataset} />
 
           {loading && (
@@ -398,6 +422,7 @@ function App() {
               <button onClick={openHistoricalStats} disabled={historyLoading}>{historyLoading ? 'Loading stats...' : 'Historical Stats'}</button>
               <button onClick={exportDataset}>Export Dataset (JSON)</button>
               <button onClick={triggerImportDataset}>Import Dataset (JSON)</button>
+              <button onClick={resetUserStats}>Reset User Stats</button>
 
               <h3>Study Priorities (basis for next quiz)</h3>
               <div className="small">Reorder and save. Follow-up prompts include your flagged questions, this analysis, and your custom instructions.</div>
