@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,8 +17,12 @@ from app.database import Base, engine, get_db
 from app.models import Attempt, AttemptAnswer, Question, Quiz, StudyTopic
 from app.schemas import (
     AttemptResponse,
+    DatasetExportResponse,
+    DatasetImportRequest,
+    DatasetImportResponse,
     GenerateQuizRequest,
     GenerateQuizResponse,
+    HistoricalStatsResponse,
     QuizGenerationJobResponse,
     QuizGenerationJobStatus,
     StudyPlanUpdateRequest,
@@ -31,7 +36,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(nam
 logger = logging.getLogger(__name__)
 service = LLMQuizService()
 
+def _ensure_schema_compatibility():
+    with engine.begin() as conn:
+        column_rows = conn.execute(text("PRAGMA table_info(questions)")).fetchall()
+        existing_columns = {row[1] for row in column_rows}
+        if "main_topic" not in existing_columns:
+            conn.execute(text("ALTER TABLE questions ADD COLUMN main_topic VARCHAR(255) DEFAULT ''"))
+        if "subcategory" not in existing_columns:
+            conn.execute(text("ALTER TABLE questions ADD COLUMN subcategory VARCHAR(120) DEFAULT ''"))
+
+
 Base.metadata.create_all(bind=engine)
+_ensure_schema_compatibility()
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -71,6 +87,14 @@ def _track_progress(
         if total is not None:
             job.total_questions = total
 
+
+
+
+def _prepare_payload_with_cleaned_topic(payload: GenerateQuizRequest) -> GenerateQuizRequest:
+    cleaned_topic = service.normalize_topic(payload.topic, payload.learning_goal)
+    if cleaned_topic == payload.topic:
+        return payload
+    return payload.model_copy(update={"topic": cleaned_topic})
 
 def _resolve_followup_context(payload: GenerateQuizRequest, db: Session):
     weak_categories = []
@@ -135,6 +159,8 @@ def _persist_quiz(db: Session, payload: GenerateQuizRequest, questions, plan) ->
                 options_json=json.dumps(q.options),
                 correct_option_index=q.correct_option_index,
                 category=q.category,
+                main_topic=payload.topic,
+                subcategory=q.category,
                 explanation=q.explanation,
             )
         )
@@ -155,7 +181,9 @@ def _persist_quiz(db: Session, payload: GenerateQuizRequest, questions, plan) ->
                 "id": q.id,
                 "prompt": q.prompt,
                 "options": json.loads(q.options_json),
-                "category": q.category,
+                "main_topic": q.main_topic or quiz.topic,
+                "category": q.subcategory or q.category,
+                "subcategory": q.subcategory or q.category,
                 "correct_option_index": q.correct_option_index,
                 "explanation": q.explanation,
             }
@@ -176,8 +204,9 @@ def _run_generation_job(job_id: str):
 
     db = next(get_db())
     try:
+        cleaned_payload = _prepare_payload_with_cleaned_topic(job.payload)
         weak_categories, flagged_prompts, prior_attempt_percentage, existing_questions = _resolve_followup_context(
-            job.payload, db
+            cleaned_payload, db
         )
         logger.info(
             "Resolved follow-up context (weak_categories=%s, flagged_prompts=%s, prior_attempt_percentage=%s)",
@@ -188,15 +217,15 @@ def _run_generation_job(job_id: str):
 
         _track_progress(job, stage="Generating question chunks", generated=0, verified=0)
         questions, plan = service.generate_questions(
-            topic=job.payload.topic,
-            learning_goal=job.payload.learning_goal,
-            difficulty=job.payload.difficulty,
-            question_count=job.payload.question_count,
-            use_web_search=job.payload.use_web_search,
+            topic=cleaned_payload.topic,
+            learning_goal=cleaned_payload.learning_goal,
+            difficulty=cleaned_payload.difficulty,
+            question_count=cleaned_payload.question_count,
+            use_web_search=cleaned_payload.use_web_search,
             weak_categories=weak_categories,
             flagged_prompts=flagged_prompts,
             prior_attempt_percentage=prior_attempt_percentage,
-            custom_instructions=job.payload.custom_instructions,
+            custom_instructions=cleaned_payload.custom_instructions,
             existing_questions=existing_questions,
             progress_callback=lambda generated, total: _track_progress(
                 job,
@@ -207,6 +236,16 @@ def _run_generation_job(job_id: str):
         )
 
         _track_progress(job, stage="Verifying generated questions", verified=0)
+        if hasattr(service, "rebalance_questions_for_option_lengths"):
+            questions = service.rebalance_questions_for_option_lengths(
+                questions,
+                progress_callback=lambda fixed, total: _track_progress(
+                    job,
+                    stage=f"Balancing option lengths ({fixed}/{total})",
+                    verified=fixed,
+                    total=total,
+                ),
+            )
         verification = service.verify_questions(
             questions,
             progress_callback=lambda checked, total: _track_progress(
@@ -263,7 +302,7 @@ def _run_generation_job(job_id: str):
                 )
 
         _track_progress(job, stage="Persisting quiz")
-        result = _persist_quiz(db, job.payload, verified_questions, plan)
+        result = _persist_quiz(db, cleaned_payload, verified_questions, plan)
 
         with job.lock:
             job.result = result
@@ -344,8 +383,11 @@ def submit_quiz(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(
 
     question_ids = {q.id for q in questions}
     answers_by_qid = {a.question_id: a for a in payload.answers}
-    if question_ids != set(answers_by_qid.keys()):
-        raise HTTPException(status_code=400, detail="All questions must be answered exactly once")
+    if len(answers_by_qid) != len(payload.answers):
+        raise HTTPException(status_code=400, detail="Each question can only be submitted once")
+    unknown_ids = set(answers_by_qid.keys()) - question_ids
+    if unknown_ids:
+        raise HTTPException(status_code=400, detail="Submission includes unknown question_id values")
 
     score = 0
     attempt = Attempt(quiz_id=quiz_id, score=0, total=len(questions), percentage=0)
@@ -353,16 +395,17 @@ def submit_quiz(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(
     db.flush()
 
     for q in questions:
-        answer = answers_by_qid[q.id]
-        is_correct = answer.selected_option_index == q.correct_option_index
-        score += int(is_correct)
+        answer = answers_by_qid.get(q.id)
+        selected_option_index = answer.selected_option_index if answer else None
+        is_correct = selected_option_index == q.correct_option_index if selected_option_index is not None else None
+        score += int(bool(is_correct))
         db.add(
             AttemptAnswer(
                 attempt_id=attempt.id,
                 question_id=q.id,
-                selected_option_index=answer.selected_option_index,
+                selected_option_index=selected_option_index,
                 is_correct=is_correct,
-                flagged_for_review=answer.flagged_for_review,
+                flagged_for_review=answer.flagged_for_review if answer else False,
             )
         )
 
@@ -408,7 +451,7 @@ def generate_error_lesson(quiz_id: int, payload: SubmitQuizRequest, db: Session 
             missed_results.append(
                 {
                     "prompt": question.prompt,
-                    "category": question.category,
+                    "category": question.subcategory or question.category,
                     "selected_option_index": answer.selected_option_index,
                     "correct_option_index": question.correct_option_index,
                     "options": json.loads(question.options_json),
@@ -425,6 +468,249 @@ def generate_error_lesson(quiz_id: int, payload: SubmitQuizRequest, db: Session 
         missed_question_results=missed_results,
     )
     return {"lesson": lesson}
+
+
+@app.get("/api/stats/history", response_model=HistoricalStatsResponse)
+def get_historical_stats(db: Session = Depends(get_db)):
+    attempts = db.query(Attempt).all()
+    answers = db.query(AttemptAnswer).all()
+    questions = db.query(Question).all()
+    quizzes = db.query(Quiz).all()
+
+    question_by_id = {q.id: q for q in questions}
+    quiz_by_id = {qz.id: qz for qz in quizzes}
+    attempt_by_id = {attempt.id: attempt for attempt in attempts}
+
+    total_answers = len(answers)
+    correct_answers = sum(1 for answer in answers if answer.is_correct is True)
+    global_accuracy = round((correct_answers / total_answers) * 100, 2) if total_answers else 0.0
+
+    category_bucket: dict[str, dict[str, int]] = {}
+    missed_questions = []
+
+    for answer in answers:
+        question = question_by_id.get(answer.question_id)
+        if not question:
+            continue
+
+        subcategory = question.subcategory or question.category
+        stats = category_bucket.setdefault(subcategory, {"correct": 0, "total": 0})
+        stats["total"] += 1
+        stats["correct"] += int(answer.is_correct is True)
+
+        if answer.is_correct:
+            continue
+
+        options = json.loads(question.options_json)
+        selected_text = (
+            options[answer.selected_option_index]
+            if answer.selected_option_index is not None and 0 <= answer.selected_option_index < len(options)
+            else ""
+        )
+        correct_text = options[question.correct_option_index] if 0 <= question.correct_option_index < len(options) else ""
+        attempt = attempt_by_id.get(answer.attempt_id)
+        quiz = quiz_by_id.get(attempt.quiz_id) if attempt else None
+
+        missed_questions.append(
+            {
+                "question_id": question.id,
+                "prompt": question.prompt,
+                "category": subcategory,
+                "quiz_topic": (quiz.topic if quiz else "") or "General",
+                "selected_option_index": answer.selected_option_index,
+                "selected_option_text": selected_text,
+                "correct_option_index": question.correct_option_index,
+                "correct_option_text": correct_text,
+                "explanation": question.explanation,
+            }
+        )
+
+    per_category_stats = [
+        {
+            "category": category,
+            "correct": row["correct"],
+            "total": row["total"],
+            "accuracy_percentage": round((row["correct"] / row["total"]) * 100, 2) if row["total"] else 0.0,
+        }
+        for category, row in sorted(category_bucket.items(), key=lambda item: item[0].lower())
+    ]
+
+    missed_questions.sort(key=lambda row: (row["quiz_topic"].lower(), row["category"].lower(), row["question_id"]))
+
+    return {
+        "global_stats": {
+            "attempts": len(attempts),
+            "questions_answered": total_answers,
+            "correct_answers": correct_answers,
+            "accuracy_percentage": global_accuracy,
+        },
+        "per_category_stats": per_category_stats,
+        "missed_questions": missed_questions,
+    }
+
+
+def _isoformat(dt: datetime | None) -> str:
+    if not dt:
+        return ""
+    return dt.isoformat()
+
+
+@app.get("/api/dataset/export", response_model=DatasetExportResponse)
+def export_dataset(db: Session = Depends(get_db)):
+    quizzes = db.query(Quiz).order_by(Quiz.id.asc()).all()
+    export_rows = []
+
+    for quiz in quizzes:
+        questions = db.query(Question).filter(Question.quiz_id == quiz.id).order_by(Question.id.asc()).all()
+        question_index_by_id = {question.id: idx + 1 for idx, question in enumerate(questions)}
+
+        attempts = db.query(Attempt).filter(Attempt.quiz_id == quiz.id).order_by(Attempt.id.asc()).all()
+        attempt_rows = []
+        for attempt in attempts:
+            answers = (
+                db.query(AttemptAnswer)
+                .filter(AttemptAnswer.attempt_id == attempt.id)
+                .order_by(AttemptAnswer.id.asc())
+                .all()
+            )
+            attempt_rows.append(
+                {
+                    "score": attempt.score,
+                    "total": attempt.total,
+                    "percentage": attempt.percentage,
+                    "started_at": _isoformat(attempt.started_at),
+                    "submitted_at": _isoformat(attempt.submitted_at),
+                    "answers": [
+                        {
+                            "question_position": question_index_by_id.get(answer.question_id, 0),
+                            "selected_option_index": answer.selected_option_index,
+                            "is_correct": answer.is_correct,
+                            "flagged_for_review": answer.flagged_for_review,
+                        }
+                        for answer in answers
+                        if question_index_by_id.get(answer.question_id)
+                    ],
+                }
+            )
+
+        export_rows.append(
+            {
+                "topic": quiz.topic,
+                "learning_goal": quiz.learning_goal,
+                "difficulty": quiz.difficulty,
+                "question_count": quiz.question_count,
+                "title": quiz.title,
+                "created_at": _isoformat(quiz.created_at),
+                "questions": [
+                    {
+                        "prompt": question.prompt,
+                        "options": json.loads(question.options_json),
+                        "correct_option_index": question.correct_option_index,
+                        "main_topic": question.main_topic or quiz.topic,
+                        "category": question.subcategory or question.category,
+                        "subcategory": question.subcategory or question.category,
+                        "explanation": question.explanation,
+                    }
+                    for question in questions
+                ],
+                "attempts": attempt_rows,
+            }
+        )
+
+    return {"format_version": "1.0", "quizzes": export_rows}
+
+
+@app.post("/api/dataset/import", response_model=DatasetImportResponse)
+def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db)):
+    imported_quizzes = 0
+    imported_questions = 0
+    imported_attempts = 0
+    imported_answers = 0
+
+    for incoming_quiz in payload.quizzes:
+        question_count = len(incoming_quiz.questions)
+        quiz = Quiz(
+            topic=incoming_quiz.topic,
+            learning_goal=incoming_quiz.learning_goal,
+            difficulty=incoming_quiz.difficulty,
+            question_count=question_count,
+            title=incoming_quiz.title or f"Imported Quiz: {incoming_quiz.topic or 'General'}",
+        )
+        db.add(quiz)
+        db.flush()
+
+        db_questions = []
+        for incoming_question in incoming_quiz.questions:
+            question = Question(
+                quiz_id=quiz.id,
+                prompt=incoming_question.prompt,
+                options_json=json.dumps(incoming_question.options),
+                correct_option_index=incoming_question.correct_option_index,
+                category=incoming_question.category,
+                main_topic=incoming_question.main_topic or incoming_quiz.topic,
+                subcategory=incoming_question.subcategory or incoming_question.category,
+                explanation=incoming_question.explanation,
+            )
+            db.add(question)
+            db_questions.append(question)
+            imported_questions += 1
+
+        db.flush()
+
+        for incoming_attempt in incoming_quiz.attempts:
+            attempt = Attempt(
+                quiz_id=quiz.id,
+                score=incoming_attempt.score or 0,
+                total=incoming_attempt.total or question_count,
+                percentage=incoming_attempt.percentage or 0,
+            )
+            db.add(attempt)
+            db.flush()
+
+            correct_counter = 0
+            for incoming_answer in incoming_attempt.answers:
+                if incoming_answer.question_position > len(db_questions):
+                    continue
+                mapped_question = db_questions[incoming_answer.question_position - 1]
+                is_correct = (
+                    incoming_answer.is_correct
+                    if incoming_answer.is_correct is not None
+                    else (
+                        incoming_answer.selected_option_index == mapped_question.correct_option_index
+                        if incoming_answer.selected_option_index is not None
+                        else None
+                    )
+                )
+                correct_counter += int(bool(is_correct))
+                db.add(
+                    AttemptAnswer(
+                        attempt_id=attempt.id,
+                        question_id=mapped_question.id,
+                        selected_option_index=incoming_answer.selected_option_index,
+                        is_correct=is_correct,
+                        flagged_for_review=incoming_answer.flagged_for_review,
+                    )
+                )
+                imported_answers += 1
+
+            if incoming_attempt.score is None:
+                attempt.score = correct_counter
+            if incoming_attempt.total is None:
+                attempt.total = len(db_questions)
+            if incoming_attempt.percentage is None:
+                attempt.percentage = round((attempt.score / attempt.total) * 100, 2) if attempt.total else 0.0
+
+            imported_attempts += 1
+
+        imported_quizzes += 1
+
+    db.commit()
+    return {
+        "imported_quizzes": imported_quizzes,
+        "imported_questions": imported_questions,
+        "imported_attempts": imported_attempts,
+        "imported_answers": imported_answers,
+    }
 
 
 @app.post("/api/attempts/{attempt_id}/study-plan", response_model=AttemptResponse)
