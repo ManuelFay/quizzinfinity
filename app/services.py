@@ -256,7 +256,7 @@ class LLMQuizService:
         prior_attempt_percentage: float | None = None,
         custom_instructions: str = "",
         existing_questions: List[str] | None = None,
-        progress_callback: Callable[[int, int], None] | None = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> tuple[List[QuestionPayload], GenerationPlan]:
         if not self.client:
             raise QuestionGenerationError("OPENAI_API_KEY is required to generate quizzes")
@@ -338,7 +338,11 @@ class LLMQuizService:
                 completed_chunks[idx] = chunk_questions
                 generated_so_far += len(chunk_questions)
                 if progress_callback:
-                    progress_callback(min(generated_so_far, total), total)
+                    progress_callback(
+                        min(generated_so_far, total),
+                        total,
+                        f"Completed category: {categories[idx].name}",
+                    )
 
         for idx, _, _ in category_requests:
             all_questions.extend(completed_chunks.get(idx, []))

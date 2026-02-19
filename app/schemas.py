@@ -59,6 +59,8 @@ class QuizGenerationJobStatus(BaseModel):
     generated_questions: int = 0
     verified_questions: int = 0
     total_questions: int = 0
+    stage_detail: str = ""
+    category_progress: List[str] = Field(default_factory=list)
     error: str = ""
     result: Optional[GenerateQuizResponse] = None
 
@@ -238,6 +240,12 @@ class DatasetImportResponse(BaseModel):
     imported_questions: int
     imported_attempts: int
     imported_answers: int
+
+
+class ResetStatsResponse(BaseModel):
+    deleted_attempts: int
+    deleted_answers: int
+    deleted_study_topics: int
 
 
 class VerificationResult(BaseModel):

@@ -68,6 +68,8 @@ function App() {
   }));
 
   async function pollGenerationJob(jobId) {
+    let maxSeenPct = 2;
+
     while (true) {
       const statusRes = await fetch(`/api/quizzes/generate/${jobId}`);
       const statusParsed = await parseApiResponse(statusRes);
@@ -76,26 +78,41 @@ function App() {
       }
 
       const status = statusParsed.data;
-      setLoadingStage(status.stage || 'Working');
+      const stage = status.stage || 'Working';
+      const stageLower = stage.toLowerCase();
+      setLoadingStage(stage);
 
       const total = Math.max(status.total_questions || questionCount, 1);
       const generated = Math.min(status.generated_questions || 0, total);
       const verified = Math.min(status.verified_questions || 0, total);
 
-      let pct = 4;
-      if (status.stage?.toLowerCase().includes('resolving')) pct = 8;
-      if (status.stage?.toLowerCase().includes('generating')) {
-        pct = Math.max(pct, 12 + Math.round((generated / total) * 58));
-        setProgressMeta(`Generated ${generated}/${total} questions`);
-      }
-      if (status.stage?.toLowerCase().includes('verifying')) {
-        pct = Math.max(pct, 72 + Math.round((verified / total) * 24));
+      let pct = 5;
+      if (stageLower.includes('resolving')) pct = 8;
+      else if (stageLower.includes('generating')) pct = 10 + Math.round((generated / total) * 50);
+      else if (stageLower.includes('balancing')) pct = 62 + Math.round((verified / total) * 12);
+      else if (stageLower.includes('verifying') || stageLower.includes('filtering')) pct = 74 + Math.round((verified / total) * 22);
+      else if (stageLower.includes('persisting')) pct = 97;
+      else if (stageLower.includes('completed')) pct = 100;
+
+      const monotonicPct = Math.min(99, Math.max(maxSeenPct, pct));
+      maxSeenPct = monotonicPct;
+      setProgressPct(monotonicPct);
+
+      const stageDetail = status.stage_detail?.trim();
+      const categoryEvents = (status.category_progress || []).filter(Boolean);
+      if (stageLower.includes('generating')) {
+        const categoryLine = categoryEvents.length ? ` · ${categoryEvents[0]}` : '';
+        setProgressMeta(`Generated ${generated}/${total} questions${categoryLine}`);
+      } else if (stageLower.includes('balancing')) {
+        setProgressMeta(`Balancing option lengths ${verified}/${total}`);
+      } else if (stageLower.includes('verifying') || stageLower.includes('filtering')) {
         setProgressMeta(`Verified ${verified}/${total} questions`);
-      }
-      if (status.stage?.toLowerCase().includes('persisting')) {
-        pct = Math.max(pct, 97);
+      } else if (stageLower.includes('persisting')) {
         setProgressMeta('Saving quiz to local database');
+      } else {
+        setProgressMeta(stageDetail || stage || 'Working');
       }
+
       if (status.state === 'completed') {
         setProgressPct(100);
         setProgressMeta('Done');
@@ -104,10 +121,7 @@ function App() {
       if (status.state === 'failed') {
         throw new Error(status.error || 'Generation failed');
       }
-      if (!status.stage?.toLowerCase().includes('generating') && !status.stage?.toLowerCase().includes('verifying') && !status.stage?.toLowerCase().includes('persisting')) {
-        setProgressMeta(status.stage || 'Working');
-      }
-      setProgressPct(Math.min(pct, 99));
+
       await new Promise((resolve) => setTimeout(resolve, 700));
     }
   }
@@ -192,6 +206,29 @@ function App() {
       setError(e.message);
     } finally {
       setLessonLoading(false);
+    }
+  }
+
+
+  async function resetUserStats() {
+    if (!confirm('Clear all user history and stats? This removes past attempts and study priorities, but keeps quizzes and questions.')) {
+      return;
+    }
+
+    setError('');
+    try {
+      await fetchJsonOrThrow(
+        '/api/stats/reset',
+        { method: 'POST' },
+        'Failed to reset user stats',
+      );
+      setResult(null);
+      setStudyTopics([]);
+      setHistoryStats(null);
+      setShowHistoryModal(false);
+      alert('User stats reset complete.');
+    } catch (e) {
+      setError(e.message);
     }
   }
 
@@ -309,12 +346,16 @@ function App() {
           <button disabled={loading} onClick={() => generateQuiz()}>{loading ? 'Generating...' : 'Generate Diagnostic Quiz'}</button>
           <button onClick={exportDataset}>Export Dataset (JSON)</button>
           <button onClick={triggerImportDataset}>Import Dataset (JSON)</button>
+          <button onClick={resetUserStats}>Reset User Stats</button>
           <input ref={fileInputRef} type="file" accept="application/json" style={{ display: 'none' }} onChange={importDataset} />
 
           {loading && (
             <div className="progress-card">
               <div className="small">{loadingStage}</div>
               <div className="small">{progressMeta}</div>
+              {loadingStage.toLowerCase().includes('generating') && (
+                <div className="small">{progressPct < 100 ? 'Parallel category generation is active.' : ''}</div>
+              )}
               <div className="progress-track">
                 <div className="progress-fill" style={{ width: `${progressPct}%` }}>
                   <span>{progressPct}%</span>
@@ -381,6 +422,7 @@ function App() {
               <button onClick={openHistoricalStats} disabled={historyLoading}>{historyLoading ? 'Loading stats...' : 'Historical Stats'}</button>
               <button onClick={exportDataset}>Export Dataset (JSON)</button>
               <button onClick={triggerImportDataset}>Import Dataset (JSON)</button>
+              <button onClick={resetUserStats}>Reset User Stats</button>
 
               <h3>Study Priorities (basis for next quiz)</h3>
               <div className="small">Reorder and save. Follow-up prompts include your flagged questions, this analysis, and your custom instructions.</div>
