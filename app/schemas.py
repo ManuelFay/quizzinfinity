@@ -14,7 +14,7 @@ class QuestionPayload(BaseModel):
 class GenerateQuizRequest(BaseModel):
     topic: str = ""
     learning_goal: str = ""
-    difficulty: int = Field(default=7, ge=1, le=10)
+    difficulty: int = Field(default=9, ge=1, le=10)
     question_count: int = Field(default=20, ge=5, le=30)
     use_web_search: bool = True
     followup_from_attempt_id: Optional[int] = None
@@ -40,6 +40,8 @@ class GenerateQuizResponse(BaseModel):
     title: str
     difficulty: int
     question_count: int
+    generation_prompt: str
+    difficulty_rationale: str
     questions: List[QuizQuestionOut]
 
 
