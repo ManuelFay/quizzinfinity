@@ -37,6 +37,10 @@ textarea, input[type="text"], input[type="number"] {
   color: var(--text);
   margin-bottom: 12px;
 }
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--primary);
+}
 button {
   background: linear-gradient(90deg, #7c3aed, #2563eb);
   color: white;
@@ -64,6 +68,50 @@ button[disabled] { background: #475569; cursor: not-allowed; }
 @keyframes progress-shimmer { from { transform: translateX(-20px); } to { transform: translateX(20px); } }
 .error-banner { margin: 8px 0 12px; background: rgba(239,68,68,0.15); color: #fecaca; border: 1px solid #ef4444; padding: 10px 12px; border-radius: 8px; }
 .prompt-box { white-space: pre-wrap; background: #020617; border: 1px solid #334155; border-radius: 10px; padding: 12px; color: #cbd5e1; }
+
+.slider-block { margin-bottom: 12px; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.modal-card {
+  width: min(780px, 100%);
+  max-height: 80vh;
+  overflow: auto;
+  border-radius: 14px;
+  border: 1px solid #334155;
+  background: linear-gradient(180deg, rgba(17,24,39,0.98), rgba(15,23,42,0.98));
+  box-shadow: 0 24px 55px rgba(2, 6, 23, 0.6);
+  padding: 16px;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.ghost-btn {
+  background: #1e293b;
+}
+
+.lesson-content {
+  white-space: pre-wrap;
+  line-height: 1.45;
+  background: #020617;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 12px;
+  color: #cbd5e1;
+}
 
 .layout { display: grid; grid-template-columns: 1fr 280px; gap: 16px; }
 .main-panel { min-width: 0; }
