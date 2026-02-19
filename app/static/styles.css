@@ -61,3 +61,8 @@ button[disabled] { background: #475569; cursor: not-allowed; }
 .progress-fill { height: 100%; border-radius: 10px; background: linear-gradient(90deg, var(--primary), var(--accent)); transition: width 0.5s ease; }
 .error-banner { margin: 8px 0 12px; background: rgba(239,68,68,0.15); color: #fecaca; border: 1px solid #ef4444; padding: 10px 12px; border-radius: 8px; }
 .prompt-box { white-space: pre-wrap; background: #020617; border: 1px solid #334155; border-radius: 10px; padding: 12px; color: #cbd5e1; }
+
+.layout { display: grid; grid-template-columns: 1fr 280px; gap: 16px; }
+.main-panel { min-width: 0; }
+.side-panel { border: 1px solid #334155; border-radius: 10px; padding: 12px; background: rgba(2, 6, 23, 0.75); height: fit-content; }
+@media (max-width: 960px) { .layout { grid-template-columns: 1fr; } }

@@ -18,6 +18,7 @@ class GenerateQuizRequest(BaseModel):
     question_count: int = Field(default=20, ge=5, le=30)
     use_web_search: bool = True
     followup_from_attempt_id: Optional[int] = None
+    custom_instructions: str = ""
 
     @model_validator(mode="after")
     def topic_or_goal_required(self):
@@ -43,6 +44,21 @@ class GenerateQuizResponse(BaseModel):
     generation_prompt: str
     difficulty_rationale: str
     questions: List[QuizQuestionOut]
+
+
+class QuizGenerationJobResponse(BaseModel):
+    job_id: str
+
+
+class QuizGenerationJobStatus(BaseModel):
+    job_id: str
+    state: str
+    stage: str
+    generated_questions: int = 0
+    verified_questions: int = 0
+    total_questions: int = 0
+    error: str = ""
+    result: Optional[GenerateQuizResponse] = None
 
 
 class AnswerIn(BaseModel):

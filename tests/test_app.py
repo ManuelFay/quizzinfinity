@@ -1,3 +1,5 @@
+import time
+
 from fastapi.testclient import TestClient
 
 from app.database import Base, engine
@@ -8,6 +10,11 @@ from app.services import QuestionGenerationError
 
 class MockService:
     def generate_questions(self, **kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback:
+            progress_callback(1, kwargs.get("question_count", 2))
+            progress_callback(2, kwargs.get("question_count", 2))
+
         class Plan:
             prompt = "mock prompt"
             difficulty = kwargs.get("difficulty", 9)
@@ -35,8 +42,24 @@ class MockService:
             ),
         ], Plan()
 
-    def verify_questions(self, questions):
+    def verify_questions(self, questions, progress_callback=None):
+        if progress_callback:
+            for i in range(len(questions)):
+                progress_callback(i + 1, len(questions))
         return VerificationResult(is_valid=True, reasons=[])
+
+
+def wait_for_job(client: TestClient, job_id: str):
+    for _ in range(50):
+        status = client.get(f"/api/quizzes/generate/{job_id}")
+        assert status.status_code == 200
+        payload = status.json()
+        if payload["state"] == "completed":
+            return payload["result"]
+        if payload["state"] == "failed":
+            raise AssertionError(payload["error"])
+        time.sleep(0.02)
+    raise AssertionError("Timed out waiting for generation job")
 
 
 def setup_module():
@@ -48,17 +71,19 @@ def test_generate_and_submit_quiz(monkeypatch):
     monkeypatch.setattr("app.main.service", MockService())
     client = TestClient(app)
 
-    gen = client.post(
+    gen_start = client.post(
         "/api/quizzes/generate",
         json={
             "topic": "machine learning",
             "learning_goal": "",
             "question_count": 5,
             "use_web_search": False,
+            "custom_instructions": "make it practical",
         },
     )
-    assert gen.status_code == 200
-    data = gen.json()
+    assert gen_start.status_code == 200
+    job_id = gen_start.json()["job_id"]
+    data = wait_for_job(client, job_id)
     assert data["quiz_id"] > 0
     assert len(data["questions"]) == 2
     assert "correct_option_index" in data["questions"][0]
@@ -82,10 +107,11 @@ def test_attempt_fetch_and_study_plan_update(monkeypatch):
     monkeypatch.setattr("app.main.service", MockService())
     client = TestClient(app)
 
-    gen = client.post(
+    gen_start = client.post(
         "/api/quizzes/generate",
         json={"topic": "statistics", "learning_goal": "", "difficulty": 7, "question_count": 5},
-    ).json()
+    )
+    gen = wait_for_job(client, gen_start.json()["job_id"])
 
     answers = [
         {"question_id": gen["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
@@ -120,12 +146,23 @@ class InvalidKeyService:
         raise QuestionGenerationError("Invalid OpenAI API key")
 
 
-def test_invalid_api_key_maps_to_401(monkeypatch):
+def test_invalid_api_key_maps_to_failed_generation_job(monkeypatch):
     monkeypatch.setattr("app.main.service", InvalidKeyService())
     client = TestClient(app)
     response = client.post(
         "/api/quizzes/generate",
         json={"topic": "calculus", "learning_goal": "", "question_count": 5, "use_web_search": False},
     )
-    assert response.status_code == 401
-    assert "Invalid OpenAI API key" in response.json()["detail"]
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    for _ in range(20):
+        status = client.get(f"/api/quizzes/generate/{job_id}")
+        assert status.status_code == 200
+        payload = status.json()
+        if payload["state"] == "failed":
+            assert "Invalid OpenAI API key" in payload["error"]
+            return
+        time.sleep(0.02)
+
+    raise AssertionError("Expected failed generation job")
