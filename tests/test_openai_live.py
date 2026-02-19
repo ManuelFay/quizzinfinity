@@ -9,7 +9,7 @@ from app.services import LLMQuizService
 @pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
 def test_live_generate_and_verify_with_gpt5():
     service = LLMQuizService()
-    questions = service.generate_questions(
+    questions, _plan = service.generate_questions(
         topic="intro linear algebra",
         learning_goal="diagnostic check",
         difficulty=6,

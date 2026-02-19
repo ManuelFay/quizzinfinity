@@ -3,10 +3,16 @@ from fastapi.testclient import TestClient
 from app.database import Base, engine
 from app.main import app
 from app.schemas import QuestionPayload, VerificationResult
+from app.services import QuestionGenerationError
 
 
 class MockService:
     def generate_questions(self, **kwargs):
+        class Plan:
+            prompt = "mock prompt"
+            difficulty = kwargs.get("difficulty", 9)
+            difficulty_rationale = "mock rationale"
+
         return [
             QuestionPayload(
                 prompt="What does Bayes theorem compute?",
@@ -27,7 +33,7 @@ class MockService:
                 category="ml-modeling",
                 explanation="Adding relevant features can reduce underfitting bias.",
             ),
-        ]
+        ], Plan()
 
     def verify_questions(self, questions):
         return VerificationResult(is_valid=True, reasons=[])
@@ -47,7 +53,6 @@ def test_generate_and_submit_quiz(monkeypatch):
         json={
             "topic": "machine learning",
             "learning_goal": "",
-            "difficulty": 8,
             "question_count": 5,
             "use_web_search": False,
         },
@@ -57,6 +62,7 @@ def test_generate_and_submit_quiz(monkeypatch):
     assert data["quiz_id"] > 0
     assert len(data["questions"]) == 2
     assert "correct_option_index" in data["questions"][0]
+    assert data["generation_prompt"] == "mock prompt"
 
     answers = [
         {"question_id": data["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
@@ -107,3 +113,19 @@ def test_health_endpoint():
     health = client.get("/api/health")
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
+
+
+class InvalidKeyService:
+    def generate_questions(self, **kwargs):
+        raise QuestionGenerationError("Invalid OpenAI API key")
+
+
+def test_invalid_api_key_maps_to_401(monkeypatch):
+    monkeypatch.setattr("app.main.service", InvalidKeyService())
+    client = TestClient(app)
+    response = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "calculus", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    assert response.status_code == 401
+    assert "Invalid OpenAI API key" in response.json()["detail"]

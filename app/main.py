@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -18,7 +19,10 @@ from app.schemas import (
 )
 from app.services import LLMQuizService, QuestionGenerationError, build_study_topics, compute_analysis
 
+
 app = FastAPI(title="Quizzinfinity")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+logger = logging.getLogger(__name__)
 service = LLMQuizService()
 
 Base.metadata.create_all(bind=engine)
@@ -40,7 +44,12 @@ def health(db: Session = Depends(get_db)):
 
 @app.post("/api/quizzes/generate", response_model=GenerateQuizResponse)
 def generate_quiz(payload: GenerateQuizRequest, db: Session = Depends(get_db)):
+    logger.info("Generate quiz request received (topic=%r, followup_from_attempt_id=%s, question_count=%s)", payload.topic, payload.followup_from_attempt_id, payload.question_count)
     weak_categories = []
+    flagged_prompts = []
+    prior_attempt_percentage = None
+    effective_difficulty = payload.difficulty
+
     if payload.followup_from_attempt_id:
         prior_topics = (
             db.query(StudyTopic)
@@ -50,43 +59,47 @@ def generate_quiz(payload: GenerateQuizRequest, db: Session = Depends(get_db)):
         )
         if prior_topics:
             weak_categories = [t.topic for t in prior_topics]
-        else:
-            prior_attempt = db.query(Attempt).filter(Attempt.id == payload.followup_from_attempt_id).first()
-            if prior_attempt:
-                answers = db.query(AttemptAnswer).filter(AttemptAnswer.attempt_id == prior_attempt.id).all()
-                questions = db.query(Question).filter(Question.quiz_id == prior_attempt.quiz_id).all()
+
+        prior_attempt = db.query(Attempt).filter(Attempt.id == payload.followup_from_attempt_id).first()
+        if prior_attempt:
+            prior_attempt_percentage = prior_attempt.percentage
+            answers = db.query(AttemptAnswer).filter(AttemptAnswer.attempt_id == prior_attempt.id).all()
+            questions = db.query(Question).filter(Question.quiz_id == prior_attempt.quiz_id).all()
+            if not weak_categories:
                 analysis = compute_analysis(questions, answers)
                 weak_categories = analysis["weaknesses"]
+            flagged_ids = {a.question_id for a in answers if a.flagged_for_review}
+            if flagged_ids:
+                flagged_prompts = [q.prompt for q in questions if q.id in flagged_ids]
 
     try:
-        questions = service.generate_questions(
+        logger.info("Resolved follow-up context (weak_categories=%s, flagged_prompts=%s, prior_attempt_percentage=%s)", len(weak_categories), len(flagged_prompts), prior_attempt_percentage)
+        questions, plan = service.generate_questions(
             topic=payload.topic,
             learning_goal=payload.learning_goal,
             difficulty=payload.difficulty,
             question_count=payload.question_count,
             use_web_search=payload.use_web_search,
             weak_categories=weak_categories,
+            flagged_prompts=flagged_prompts,
+            prior_attempt_percentage=prior_attempt_percentage,
         )
+        effective_difficulty = plan.difficulty
         verification = service.verify_questions(questions)
+        logger.info("Quiz generated successfully with %s questions and difficulty=%s", len(questions), effective_difficulty)
         if not verification.is_valid:
-            questions = service.generate_questions(
-                topic=payload.topic,
-                learning_goal=payload.learning_goal,
-                difficulty=payload.difficulty,
-                question_count=payload.question_count,
-                use_web_search=payload.use_web_search,
-                weak_categories=weak_categories,
-            )
-            verification = service.verify_questions(questions)
-            if not verification.is_valid:
-                raise QuestionGenerationError("Verification failed: " + "; ".join(verification.reasons))
+            raise QuestionGenerationError("Verification failed: " + "; ".join(verification.reasons))
+    except QuestionGenerationError as exc:
+        detail = str(exc)
+        status = 401 if "api key" in detail.lower() else 500
+        raise HTTPException(status_code=status, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Quiz generation failed: {exc}") from exc
 
     quiz = Quiz(
         topic=payload.topic,
         learning_goal=payload.learning_goal,
-        difficulty=payload.difficulty,
+        difficulty=effective_difficulty,
         question_count=payload.question_count,
         title=f"Diagnostic Quiz: {payload.topic or payload.learning_goal[:60]}",
     )
@@ -113,6 +126,8 @@ def generate_quiz(payload: GenerateQuizRequest, db: Session = Depends(get_db)):
         "quiz_id": quiz.id,
         "title": quiz.title,
         "difficulty": quiz.difficulty,
+        "difficulty_rationale": plan.difficulty_rationale,
+        "generation_prompt": plan.prompt,
         "question_count": quiz.question_count,
         "questions": [
             {
@@ -217,9 +232,6 @@ def _build_attempt_response(attempt: Attempt, db: Session):
         "score": attempt.score,
         "total": attempt.total,
         "percentage": attempt.percentage,
-        "study_topics": [
-            {"topic": t.topic, "priority": t.priority, "source": t.source}
-            for t in topics
-        ],
+        "study_topics": [{"topic": t.topic, "priority": t.priority, "source": t.source} for t in topics],
         **{k: v for k, v in analysis.items() if k != "raw_category_summary"},
     }
