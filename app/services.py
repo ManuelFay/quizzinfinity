@@ -84,6 +84,16 @@ VERIFICATION_SCHEMA = {
 }
 
 
+ERROR_LESSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "lesson": {"type": "string"},
+    },
+    "required": ["lesson"],
+}
+
+
 QUESTION_REPAIR_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -143,11 +153,13 @@ class LLMQuizService:
         flagged_prompts: List[str] | None = None,
         prior_attempt_percentage: float | None = None,
         custom_instructions: str = "",
+        existing_questions: List[str] | None = None,
     ) -> GenerationPlan:
         normalized_topic = topic.strip() or "General topic"
         normalized_goal = learning_goal.strip() or "Strengthen deep conceptual mastery"
         weak_categories = weak_categories or []
         flagged_prompts = flagged_prompts or []
+        existing_questions = existing_questions or []
 
         difficulty = requested_difficulty
         rationale = "Using user-selected difficulty."
@@ -175,15 +187,23 @@ class LLMQuizService:
         weak_text = ", ".join(weak_categories) if weak_categories else "none"
         flagged_text = "\n".join(f"- {x}" for x in flagged_prompts) if flagged_prompts else "- none"
         instruction_text = custom_instructions.strip() or "none"
+        existing_questions_text = (
+            "\n".join(f"- {question}" for question in existing_questions)
+            if existing_questions
+            else "- none"
+        )
         prompt = (
             "Generate diagnostic multiple-choice questions and return JSON only with key 'questions'. "
             "Each question must include prompt, 4 distinct options, correct_option_index (0-3), category, explanation. "
             "Prioritize conceptual rigor, plausible distractors, and explanations that teach. "
+            "Keep option lengths balanced so the correct answer is not noticeably longer than distractors. "
             f"Topic: {normalized_topic}. Learning goal: {normalized_goal}. "
             f"Difficulty (1-10): {difficulty}. "
             f"Prior weak categories to emphasize: {weak_text}. "
             "Questions explicitly flagged by learner for extra reinforcement:\n"
             f"{flagged_text}\n"
+            "Questions already asked in prior quizzes. Avoid duplicates or near-duplicates:\n"
+            f"{existing_questions_text}\n"
             f"Additional user instructions for follow-up generation: {instruction_text}."
         )
         return GenerationPlan(prompt=prompt, difficulty=difficulty, difficulty_rationale=rationale)
@@ -200,6 +220,7 @@ class LLMQuizService:
         flagged_prompts: List[str] | None = None,
         prior_attempt_percentage: float | None = None,
         custom_instructions: str = "",
+        existing_questions: List[str] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> tuple[List[QuestionPayload], GenerationPlan]:
         if not self.client:
@@ -213,6 +234,7 @@ class LLMQuizService:
             flagged_prompts=flagged_prompts,
             prior_attempt_percentage=prior_attempt_percentage,
             custom_instructions=custom_instructions,
+            existing_questions=existing_questions,
         )
 
         tools = [{"type": "web_search_preview"}] if use_web_search else []
@@ -236,6 +258,7 @@ class LLMQuizService:
             weak_categories=weak_categories or [],
             flagged_prompts=flagged_prompts or [],
             custom_instructions=custom_instructions,
+            existing_questions=existing_questions or [],
             tools=tools,
         )
         logger.info("Question category plan: %s", [c.__dict__ for c in categories])
@@ -306,8 +329,14 @@ class LLMQuizService:
         weak_categories: List[str],
         flagged_prompts: List[str],
         custom_instructions: str,
+        existing_questions: List[str],
         tools,
     ) -> List[CategoryPlan]:
+        existing_questions_text = (
+            "\n".join(f"- {question}" for question in existing_questions)
+            if existing_questions
+            else "- none"
+        )
         planner_prompt = (
             "Plan a diverse quiz blueprint and return JSON only in the form "
             "{'categories':[{'name':str,'focus':str,'question_target':int}]}. "
@@ -315,6 +344,8 @@ class LLMQuizService:
             f"Total planned question_target must sum to {target_count}. "
             f"Topic: {topic}. Learning goal: {learning_goal}. Difficulty: {plan.difficulty}. "
             f"Weak categories to cover: {weak_categories}. Flagged prompts: {flagged_prompts}. "
+            "Questions already asked in prior quizzes (must avoid duplicates/near-duplicates):\n"
+            f"{existing_questions_text}\n"
             f"Additional instructions: {custom_instructions or 'none'}."
         )
         payload = self._generate_json_with_retry(
@@ -426,7 +457,8 @@ class LLMQuizService:
             "Verify this list of quiz questions for correctness, non-ambiguity, and diversity. "
             "Return JSON with {is_valid:boolean,reasons:string[]}. "
             "Check exactly 4 unique options, single valid correct index, non-empty category and explanation, "
-            "clear unambiguous wording, and avoid near-duplicate questions. "
+            "clear unambiguous wording, avoid near-duplicate questions, and ensure the correct option is not "
+            "noticeably longer than distractors. "
             f"Questions: {json.dumps([q.model_dump() for q in questions])}"
         )
         payload = self._generate_json_with_retry(
@@ -445,6 +477,7 @@ class LLMQuizService:
         repair_prompt = (
             "Repair this multiple-choice quiz question so it is correct, unambiguous, and technically feasible. "
             "Return one fixed question. Keep 4 unique options, a valid correct_option_index, and a clear explanation. "
+            "Ensure the correct option is not noticeably longer than the distractors. "
             "Preserve the core learning objective and category when possible. "
             f"Original question: {json.dumps(question.model_dump())}. "
             f"Verification issues to address: {json.dumps(reasons)}"
@@ -457,6 +490,32 @@ class LLMQuizService:
         repaired = QuestionPayload(**payload["question"])
         self._validate_questions([repaired])
         return repaired
+
+    def generate_error_lesson(
+        self,
+        *,
+        topic: str,
+        learning_goal: str,
+        missed_question_results: list[dict],
+    ) -> str:
+        if not self.client:
+            raise QuestionGenerationError("OPENAI_API_KEY is required to generate a lesson")
+
+        prompt = (
+            "Create a short remedial lesson tailored to a learner's quiz mistakes. "
+            "Return JSON with {'lesson': string}. "
+            "The lesson must include: (1) 3-5 concise concept bullets, "
+            "(2) why each missed item was tempting/wrong, "
+            "(3) a quick checklist for next attempt. "
+            f"Topic: {topic or 'General topic'}. Learning goal: {learning_goal or 'Improve mastery'}. "
+            f"Missed question data: {json.dumps(missed_question_results)}"
+        )
+        payload = self._generate_json_with_retry(
+            prompt=prompt,
+            schema_name="error_lesson",
+            schema=ERROR_LESSON_SCHEMA,
+        )
+        return str(payload["lesson"]).strip()
 
     @staticmethod
     def _extract_json(text: str):

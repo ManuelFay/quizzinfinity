@@ -23,8 +23,10 @@ async function parseApiResponse(res) {
 function App() {
   const [topic, setTopic] = useState('');
   const [learningGoal, setLearningGoal] = useState('');
+  const [difficulty, setDifficulty] = useState(9);
   const [questionCount, setQuestionCount] = useState(20);
   const [customInstructions, setCustomInstructions] = useState('');
+  const [followupInstructions, setFollowupInstructions] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingStage, setLoadingStage] = useState('Queued');
   const [progressPct, setProgressPct] = useState(0);
@@ -37,6 +39,9 @@ function App() {
   const [idx, setIdx] = useState(0);
   const [result, setResult] = useState(null);
   const [studyTopics, setStudyTopics] = useState([]);
+  const [lessonLoading, setLessonLoading] = useState(false);
+  const [errorLesson, setErrorLesson] = useState('');
+  const [showLessonModal, setShowLessonModal] = useState(false);
 
   const missedQuestions = useMemo(() => {
     if (!quiz) return [];
@@ -106,10 +111,11 @@ function App() {
         body: JSON.stringify({
           topic,
           learning_goal: learningGoal,
+          difficulty,
           question_count: questionCount,
           use_web_search: true,
           followup_from_attempt_id: followupFrom,
-          custom_instructions: customInstructions,
+          custom_instructions: followupFrom ? followupInstructions : customInstructions,
         }),
       });
       const parsed = await parseApiResponse(res);
@@ -118,6 +124,8 @@ function App() {
       const generatedQuiz = await pollGenerationJob(parsed.data.job_id);
       setQuiz(generatedQuiz);
       setIdx(0);
+      setErrorLesson('');
+      setShowLessonModal(false);
       setProgressPct(100);
       setProgressMeta('Done');
     } catch (e) {
@@ -142,6 +150,32 @@ function App() {
     if (!parsed.ok || !parsed.data) return setError(parsed.detail || 'Submit failed');
     setResult(parsed.data);
     setStudyTopics(parsed.data.study_topics || []);
+  }
+
+  async function requestErrorLesson() {
+    if (!quiz) return;
+    setLessonLoading(true);
+    setError('');
+    try {
+      const formattedAnswers = quiz.questions.map((q) => ({
+        question_id: q.id,
+        selected_option_index: answers[q.id],
+        flagged_for_review: !!flags[q.id],
+      }));
+      const res = await fetch(`/api/quizzes/${quiz.quiz_id}/error-lesson`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers: formattedAnswers }),
+      });
+      const parsed = await parseApiResponse(res);
+      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to generate lesson');
+      setErrorLesson(parsed.data.lesson || 'No lesson returned.');
+      setShowLessonModal(true);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLessonLoading(false);
+    }
   }
 
   async function saveStudyPlan() {
@@ -183,6 +217,10 @@ function App() {
           <input type="text" placeholder="Topic (e.g. Probability Theory)" value={topic} onChange={(e) => setTopic(e.target.value)} />
           <textarea rows="4" placeholder="What exactly do you want to learn? Add any preferences for easier/harder emphasis." value={learningGoal} onChange={(e) => setLearningGoal(e.target.value)} />
           <textarea rows="3" placeholder="Custom instructions for next quiz generation (optional). These are combined with your analysis + flagged questions." value={customInstructions} onChange={(e) => setCustomInstructions(e.target.value)} />
+          <div className="slider-block">
+            <label>Difficulty: <strong>{difficulty}</strong>/10</label>
+            <input type="range" min="1" max="10" value={difficulty} onChange={(e) => setDifficulty(Number(e.target.value))} />
+          </div>
           <div className="row">
             <label>Questions:</label>
             <input type="number" min="5" max="30" value={questionCount} onChange={(e) => setQuestionCount(Number(e.target.value))} style={{ width: '100px' }} />
@@ -269,10 +307,14 @@ function App() {
                 ))}
               </ul>
               <button onClick={saveStudyPlan}>Save Study Priority List</button>
+              <textarea
+                rows="3"
+                placeholder="Additional instructions for follow-up quiz generation (optional)"
+                value={followupInstructions}
+                onChange={(e) => setFollowupInstructions(e.target.value)}
+              />
               <button onClick={() => generateQuiz(result.attempt_id)}>Generate Follow-up Quiz from Study Priorities</button>
-
-              <h3>Prompt Used for Latest Generation</h3>
-              <pre className="prompt-box">{quiz.generation_prompt}</pre>
+              <button onClick={requestErrorLesson} disabled={lessonLoading}>{lessonLoading ? 'Generating lesson...' : 'Get LLM Error Analysis + Lesson'}</button>
             </div>
           )}
         </div>
@@ -286,6 +328,18 @@ function App() {
           )}
         </aside>
       </div>
+
+      {showLessonModal && (
+        <div className="modal-overlay" onClick={() => setShowLessonModal(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Error Analysis Lesson</h3>
+              <button className="ghost-btn" onClick={() => setShowLessonModal(false)}>Close</button>
+            </div>
+            <pre className="lesson-content">{errorLesson}</pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

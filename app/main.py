@@ -76,6 +76,20 @@ def _resolve_followup_context(payload: GenerateQuizRequest, db: Session):
     weak_categories = []
     flagged_prompts = []
     prior_attempt_percentage = None
+    existing_questions = []
+
+    if payload.topic.strip() or payload.learning_goal.strip():
+        prior_quizzes = db.query(Quiz).all()
+        for prior_quiz in prior_quizzes:
+            same_topic = payload.topic.strip() and prior_quiz.topic and prior_quiz.topic.strip() == payload.topic.strip()
+            same_goal = (
+                payload.learning_goal.strip()
+                and prior_quiz.learning_goal
+                and prior_quiz.learning_goal.strip() == payload.learning_goal.strip()
+            )
+            if same_topic or same_goal:
+                prior_questions = db.query(Question).filter(Question.quiz_id == prior_quiz.id).all()
+                existing_questions.extend([q.prompt for q in prior_questions])
 
     if payload.followup_from_attempt_id:
         prior_topics = (
@@ -99,7 +113,7 @@ def _resolve_followup_context(payload: GenerateQuizRequest, db: Session):
             if flagged_ids:
                 flagged_prompts = [q.prompt for q in questions if q.id in flagged_ids]
 
-    return weak_categories, flagged_prompts, prior_attempt_percentage
+    return weak_categories, flagged_prompts, prior_attempt_percentage, existing_questions
 
 
 def _persist_quiz(db: Session, payload: GenerateQuizRequest, questions, plan) -> GenerateQuizResponse:
@@ -162,7 +176,9 @@ def _run_generation_job(job_id: str):
 
     db = next(get_db())
     try:
-        weak_categories, flagged_prompts, prior_attempt_percentage = _resolve_followup_context(job.payload, db)
+        weak_categories, flagged_prompts, prior_attempt_percentage, existing_questions = _resolve_followup_context(
+            job.payload, db
+        )
         logger.info(
             "Resolved follow-up context (weak_categories=%s, flagged_prompts=%s, prior_attempt_percentage=%s)",
             len(weak_categories),
@@ -181,6 +197,7 @@ def _run_generation_job(job_id: str):
             flagged_prompts=flagged_prompts,
             prior_attempt_percentage=prior_attempt_percentage,
             custom_instructions=job.payload.custom_instructions,
+            existing_questions=existing_questions,
             progress_callback=lambda generated, total: _track_progress(
                 job,
                 stage=f"Generating questions ({generated}/{total})",
@@ -370,6 +387,44 @@ def submit_quiz(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(
         "study_topics": topics,
         **{k: v for k, v in analysis.items() if k != "raw_category_summary"},
     }
+
+
+@app.post("/api/quizzes/{quiz_id}/error-lesson")
+def generate_error_lesson(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(get_db)):
+    questions = db.query(Question).filter(Question.quiz_id == quiz_id).all()
+    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+    if not questions or not quiz:
+        raise HTTPException(status_code=404, detail="Quiz not found")
+
+    question_ids = {q.id for q in questions}
+    answers_by_qid = {a.question_id: a for a in payload.answers}
+    if question_ids != set(answers_by_qid.keys()):
+        raise HTTPException(status_code=400, detail="All questions must be answered exactly once")
+
+    missed_results = []
+    for question in questions:
+        answer = answers_by_qid[question.id]
+        if answer.selected_option_index != question.correct_option_index:
+            missed_results.append(
+                {
+                    "prompt": question.prompt,
+                    "category": question.category,
+                    "selected_option_index": answer.selected_option_index,
+                    "correct_option_index": question.correct_option_index,
+                    "options": json.loads(question.options_json),
+                    "explanation": question.explanation,
+                }
+            )
+
+    if not missed_results:
+        return {"lesson": "Great job—you did not miss any questions in this quiz."}
+
+    lesson = service.generate_error_lesson(
+        topic=quiz.topic,
+        learning_goal=quiz.learning_goal,
+        missed_question_results=missed_results,
+    )
+    return {"lesson": lesson}
 
 
 @app.post("/api/attempts/{attempt_id}/study-plan", response_model=AttemptResponse)
