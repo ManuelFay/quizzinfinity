@@ -65,6 +65,15 @@ class HintCachingService(MockService):
         return "## Think First\nUse elimination."
 
 
+class ExistingQuestionCaptureService(MockService):
+    def __init__(self):
+        self.last_existing_questions = None
+
+    def generate_questions(self, **kwargs):
+        self.last_existing_questions = kwargs.get("existing_questions")
+        return super().generate_questions(**kwargs)
+
+
 def wait_for_job(client: TestClient, job_id: str):
     for _ in range(50):
         status = client.get(f"/api/quizzes/generate/{job_id}")
@@ -117,6 +126,38 @@ def test_generate_and_submit_quiz(monkeypatch):
     assert len(payload["category_summary"]) == 2
     assert len(payload["study_topics"]) == 2
     assert any(x["flagged_for_review"] for x in payload["question_results"])
+
+
+def test_followup_existing_questions_only_include_same_topic(monkeypatch):
+    service = ExistingQuestionCaptureService()
+    monkeypatch.setattr("app.main.service", service)
+    client = TestClient(app)
+
+    first = client.post(
+        "/api/quizzes/generate",
+        json={
+            "topic": "algebra",
+            "learning_goal": "linear equations",
+            "question_count": 5,
+            "use_web_search": False,
+        },
+    )
+    assert first.status_code == 200
+    wait_for_job(client, first.json()["job_id"])
+
+    second = client.post(
+        "/api/quizzes/generate",
+        json={
+            "topic": "geometry",
+            "learning_goal": "linear equations",
+            "question_count": 5,
+            "use_web_search": False,
+        },
+    )
+    assert second.status_code == 200
+    wait_for_job(client, second.json()["job_id"])
+
+    assert service.last_existing_questions == []
 
 
 def test_attempt_fetch_and_study_plan_update(monkeypatch):

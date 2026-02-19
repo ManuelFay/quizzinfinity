@@ -112,16 +112,11 @@ def _resolve_followup_context(payload: GenerateQuizRequest, db: Session):
     prior_attempt_percentage = None
     existing_questions = []
 
-    if payload.topic.strip() or payload.learning_goal.strip():
+    if payload.topic.strip():
         prior_quizzes = db.query(Quiz).all()
         for prior_quiz in prior_quizzes:
-            same_topic = payload.topic.strip() and prior_quiz.topic and prior_quiz.topic.strip() == payload.topic.strip()
-            same_goal = (
-                payload.learning_goal.strip()
-                and prior_quiz.learning_goal
-                and prior_quiz.learning_goal.strip() == payload.learning_goal.strip()
-            )
-            if same_topic or same_goal:
+            same_topic = prior_quiz.topic and prior_quiz.topic.strip() == payload.topic.strip()
+            if same_topic:
                 prior_questions = db.query(Question).filter(Question.quiz_id == prior_quiz.id).all()
                 existing_questions.extend([q.prompt for q in prior_questions])
 
