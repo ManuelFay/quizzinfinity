@@ -1,0 +1,15 @@
+body { font-family: Inter, Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1f2937; }
+.container { max-width: 960px; margin: 24px auto; padding: 24px; background: #fff; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.07); }
+h1 { margin-top: 0; }
+textarea, input, button { font: inherit; }
+textarea, input[type="text"] { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #d1d5db; margin-bottom: 12px; }
+button { background:#2563eb; color:white; border:none; padding:10px 14px; border-radius:8px; cursor:pointer; margin-right: 8px; }
+button[disabled] { background:#9ca3af; cursor:not-allowed; }
+.question { margin: 20px 0; padding: 16px; border:1px solid #e5e7eb; border-radius:10px; }
+.option { display:block; margin:8px 0; padding:10px; border:1px solid #d1d5db; border-radius:8px; cursor:pointer; }
+.option.selected { border-color:#2563eb; background:#eff6ff; }
+.badge { display:inline-block; font-size: 12px; background:#eef2ff; color:#3730a3; padding:4px 8px; border-radius:20px; margin-bottom: 10px; }
+.row { display:flex; gap:12px; align-items:center; }
+.small { color: #6b7280; font-size: 14px; }
+.result-card { border-left: 4px solid #10b981; padding: 10px 12px; background: #ecfdf5; margin-bottom:8px; }
+.result-card.wrong { border-left-color:#ef4444; background:#fef2f2; }

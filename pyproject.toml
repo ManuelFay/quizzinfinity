@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quizzinfinity"
+version = "0.1.0"
+description = "Adaptive quiz diagnostics and study assistant"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "sqlalchemy>=2.0.30",
+  "pydantic>=2.8.0",
+  "python-dotenv>=1.0.1",
+  "openai>=1.51.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "httpx>=0.27.0"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+  "integration: live integration tests that may call external APIs"
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
