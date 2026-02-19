@@ -117,3 +117,28 @@ button[disabled] { background: #475569; cursor: not-allowed; }
 .main-panel { min-width: 0; }
 .side-panel { border: 1px solid #334155; border-radius: 10px; padding: 12px; background: rgba(2, 6, 23, 0.75); height: fit-content; }
 @media (max-width: 960px) { .layout { grid-template-columns: 1fr; } }
+
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3 {
+  margin: 12px 0 8px;
+  color: #e2e8f0;
+}
+
+.markdown-content p,
+.markdown-content li {
+  margin: 6px 0;
+}
+
+.markdown-content ul {
+  margin: 6px 0 10px 18px;
+}
+
+.markdown-content code {
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}

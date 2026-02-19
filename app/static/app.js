@@ -1,6 +1,75 @@
 const { useMemo, useRef, useState } = React;
 
 
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function renderInlineMarkdown(text) {
+  return text
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+}
+
+function markdownToHtml(markdown) {
+  const lines = escapeHtml(markdown || '').split('\n');
+  const html = [];
+  let inList = false;
+
+  const closeListIfOpen = () => {
+    if (inList) {
+      html.push('</ul>');
+      inList = false;
+    }
+  };
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      closeListIfOpen();
+      return;
+    }
+
+    if (trimmed.startsWith('### ')) {
+      closeListIfOpen();
+      html.push(`<h3>${renderInlineMarkdown(trimmed.slice(4))}</h3>`);
+      return;
+    }
+    if (trimmed.startsWith('## ')) {
+      closeListIfOpen();
+      html.push(`<h2>${renderInlineMarkdown(trimmed.slice(3))}</h2>`);
+      return;
+    }
+    if (trimmed.startsWith('# ')) {
+      closeListIfOpen();
+      html.push(`<h1>${renderInlineMarkdown(trimmed.slice(2))}</h1>`);
+      return;
+    }
+
+    if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+      if (!inList) {
+        html.push('<ul>');
+        inList = true;
+      }
+      html.push(`<li>${renderInlineMarkdown(trimmed.slice(2))}</li>`);
+      return;
+    }
+
+    closeListIfOpen();
+    html.push(`<p>${renderInlineMarkdown(trimmed)}</p>`);
+  });
+
+  closeListIfOpen();
+  return html.join('');
+}
+
 async function parseApiResponse(res) {
   const raw = await res.text();
   if (!raw) {
@@ -495,10 +564,10 @@ function App() {
         <div className="modal-overlay" onClick={() => setShowLessonModal(false)}>
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>Error Analysis Lesson</h3>
+              <h3>Error Analysis + Lesson (Markdown)</h3>
               <button className="ghost-btn" onClick={() => setShowLessonModal(false)}>Close</button>
             </div>
-            <pre className="lesson-content">{errorLesson}</pre>
+            <div className="lesson-content markdown-content" dangerouslySetInnerHTML={{ __html: markdownToHtml(errorLesson) }} />
           </div>
         </div>
       )}
