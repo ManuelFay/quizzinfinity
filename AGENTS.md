@@ -42,6 +42,8 @@ uvicorn app.main:app --reload --port 8000
 - `OPENAI_BASE_URL` — optional override for API endpoint.
 
 ## Notes for future contributors/agents
-- The frontend currently reveals `correct_option_index` and explanation in generate response to support immediate feedback UX.
+- Frontend currently reveals `correct_option_index` and explanation in generate response to support immediate feedback UX.
 - Study priorities are persisted and intended to be the basis for follow-up quizzes.
 - SQLite DB file path: `data/quizzinfinity.db`.
+- Prefer shared helpers in `app/static/app.js` (`fetchJsonOrThrow`, `buildFormattedAnswers`) instead of repeating fetch/error or answer-shaping blocks.
+- Keep user-facing copy/comments concise and behavior-focused; remove stale implementation-detail comments during refactors.

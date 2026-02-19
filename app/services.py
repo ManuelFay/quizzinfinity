@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import random
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -343,7 +344,8 @@ class LLMQuizService:
             all_questions.extend(completed_chunks.get(idx, []))
 
         deduped_questions = self._deduplicate_questions(all_questions)
-        final_questions = deduped_questions[:question_count]
+        randomized_questions = self.randomize_questions_option_order(deduped_questions)
+        final_questions = randomized_questions[:question_count]
         logger.info(
             "Generated %s raw questions, %s after dedupe, returning %s",
             len(all_questions),
@@ -402,6 +404,28 @@ class LLMQuizService:
             return [CategoryPlan(name="General", focus="Core concepts", question_target=target_count)]
 
         return self._rebalance_targets(categories, target_count)
+
+    @staticmethod
+    def randomize_question_option_order(question: QuestionPayload, rng: random.Random | None = None) -> QuestionPayload:
+        rng = rng or random
+        option_indices = list(range(len(question.options)))
+        rng.shuffle(option_indices)
+
+        randomized_options = [question.options[idx] for idx in option_indices]
+        randomized_correct_index = option_indices.index(question.correct_option_index)
+        return question.model_copy(
+            update={
+                "options": randomized_options,
+                "correct_option_index": randomized_correct_index,
+            }
+        )
+
+    def randomize_questions_option_order(
+        self,
+        questions: List[QuestionPayload],
+        rng: random.Random | None = None,
+    ) -> List[QuestionPayload]:
+        return [self.randomize_question_option_order(question, rng) for question in questions]
 
     @staticmethod
     def _rebalance_targets(categories: List[CategoryPlan], target_count: int) -> List[CategoryPlan]:
