@@ -94,6 +94,17 @@ ERROR_LESSON_SCHEMA = {
 }
 
 
+
+
+TOPIC_NORMALIZATION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "cleaned_topic": {"type": "string"},
+    },
+    "required": ["cleaned_topic"],
+}
+
 QUESTION_REPAIR_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -207,6 +218,29 @@ class LLMQuizService:
             f"Additional user instructions for follow-up generation: {instruction_text}."
         )
         return GenerationPlan(prompt=prompt, difficulty=difficulty, difficulty_rationale=rationale)
+
+
+    def normalize_topic(self, topic: str, learning_goal: str = "") -> str:
+        raw_topic = topic.strip()
+        if not raw_topic:
+            return ""
+        if not self.client:
+            return raw_topic
+
+        prompt = (
+            "Clean and standardize the learner's quiz topic label for storage. "
+            "Return JSON with {'cleaned_topic': string}. "
+            "Keep it concise (2-6 words), title case, and preserve intent. "
+            "Do not include extra commentary. "
+            f"Raw topic: {raw_topic}. Learning goal context: {learning_goal.strip() or 'none'}."
+        )
+        payload = self._generate_json_with_retry(
+            prompt=prompt,
+            schema_name="topic_normalization",
+            schema=TOPIC_NORMALIZATION_SCHEMA,
+        )
+        cleaned_topic = str(payload.get("cleaned_topic", "")).strip()
+        return cleaned_topic or raw_topic
 
     def generate_questions(
         self,

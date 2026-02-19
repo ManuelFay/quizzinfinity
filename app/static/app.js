@@ -1,4 +1,4 @@
-const { useMemo, useState } = React;
+const { useMemo, useRef, useState } = React;
 
 
 async function parseApiResponse(res) {
@@ -42,6 +42,10 @@ function App() {
   const [lessonLoading, setLessonLoading] = useState(false);
   const [errorLesson, setErrorLesson] = useState('');
   const [showLessonModal, setShowLessonModal] = useState(false);
+  const [historyStats, setHistoryStats] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const fileInputRef = useRef(null);
 
   const missedQuestions = useMemo(() => {
     if (!quiz) return [];
@@ -178,6 +182,72 @@ function App() {
     }
   }
 
+  async function openHistoricalStats() {
+    setHistoryLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/stats/history');
+      const parsed = await parseApiResponse(res);
+      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to load historical stats');
+      setHistoryStats(parsed.data);
+      setShowHistoryModal(true);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function exportDataset() {
+    setError('');
+    try {
+      const res = await fetch('/api/dataset/export');
+      const parsed = await parseApiResponse(res);
+      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to export dataset');
+
+      const blob = new Blob([JSON.stringify(parsed.data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `quizzinfinity-dataset-${Date.now()}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  function triggerImportDataset() {
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
+    }
+  }
+
+  async function importDataset(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setError('');
+
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      const res = await fetch('/api/dataset/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const parsed = await parseApiResponse(res);
+      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to import dataset');
+      const imported = parsed.data;
+      alert(`Import complete: ${imported.imported_quizzes} quizzes, ${imported.imported_questions} questions, ${imported.imported_attempts} attempts.`);
+    } catch (e) {
+      setError(`Import failed: ${e.message}`);
+    }
+  }
+
   async function saveStudyPlan() {
     if (!result) return;
     const res = await fetch(`/api/attempts/${result.attempt_id}/study-plan`, {
@@ -226,6 +296,9 @@ function App() {
             <input type="number" min="5" max="30" value={questionCount} onChange={(e) => setQuestionCount(Number(e.target.value))} style={{ width: '100px' }} />
           </div>
           <button disabled={loading} onClick={() => generateQuiz()}>{loading ? 'Generating...' : 'Generate Diagnostic Quiz'}</button>
+          <button onClick={exportDataset}>Export Dataset (JSON)</button>
+          <button onClick={triggerImportDataset}>Import Dataset (JSON)</button>
+          <input ref={fileInputRef} type="file" accept="application/json" style={{ display: 'none' }} onChange={importDataset} />
 
           {loading && (
             <div className="progress-card">
@@ -294,6 +367,9 @@ function App() {
               </ul>
               <p><strong>Strengths:</strong> {result.strengths.join(', ') || '—'}</p>
               <p><strong>Weaknesses:</strong> {result.weaknesses.join(', ') || '—'}</p>
+              <button onClick={openHistoricalStats} disabled={historyLoading}>{historyLoading ? 'Loading stats...' : 'Historical Stats'}</button>
+              <button onClick={exportDataset}>Export Dataset (JSON)</button>
+              <button onClick={triggerImportDataset}>Import Dataset (JSON)</button>
 
               <h3>Study Priorities (basis for next quiz)</h3>
               <div className="small">Reorder and save. Follow-up prompts include your flagged questions, this analysis, and your custom instructions.</div>
@@ -328,6 +404,39 @@ function App() {
           )}
         </aside>
       </div>
+
+
+      {showHistoryModal && historyStats && (
+        <div className="modal-overlay" onClick={() => setShowHistoryModal(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Historical Stats</h3>
+              <button className="ghost-btn" onClick={() => setShowHistoryModal(false)}>Close</button>
+            </div>
+            <div className="small">
+              Attempts: {historyStats.global_stats.attempts} · Questions answered: {historyStats.global_stats.questions_answered} · Correct: {historyStats.global_stats.correct_answers} · Accuracy: {historyStats.global_stats.accuracy_percentage}%
+            </div>
+            <h4>Per category</h4>
+            <ul>
+              {historyStats.per_category_stats.map((row) => (
+                <li key={row.category}>{row.category}: {row.correct}/{row.total} ({row.accuracy_percentage}%)</li>
+              ))}
+            </ul>
+            <h4>Missed questions to review</h4>
+            {historyStats.missed_questions.length === 0 ? <div className="small">No missed questions recorded yet.</div> : (
+              <ul>
+                {historyStats.missed_questions.map((miss) => (
+                  <li key={`${miss.question_id}-${miss.selected_option_index}`}>
+                    <strong>{miss.quiz_topic}</strong> · {miss.category}<br />
+                    {miss.prompt}<br />
+                    <span className="small">Your answer: {miss.selected_option_text} | Correct: {miss.correct_option_text}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
 
       {showLessonModal && (
         <div className="modal-overlay" onClick={() => setShowLessonModal(false)}>

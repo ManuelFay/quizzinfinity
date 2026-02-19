@@ -9,6 +9,9 @@ from app.services import QuestionGenerationError
 
 
 class MockService:
+    def normalize_topic(self, topic, learning_goal=""):
+        return "Machine Learning Fundamentals" if topic.strip() == "machine learning" else topic
+
     def generate_questions(self, **kwargs):
         progress_callback = kwargs.get("progress_callback")
         if progress_callback:
@@ -134,6 +137,95 @@ def test_attempt_fetch_and_study_plan_update(monkeypatch):
     assert get_attempt.json()["attempt_id"] == attempt_id
 
 
+def test_dataset_export_and_import(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    gen_start = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "machine learning", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    gen = wait_for_job(client, gen_start.json()["job_id"])
+
+    answers = [
+        {"question_id": gen["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
+        {"question_id": gen["questions"][1]["id"], "selected_option_index": 2, "flagged_for_review": True},
+    ]
+    submit = client.post(f"/api/quizzes/{gen['quiz_id']}/submit", json={"answers": answers})
+    assert submit.status_code == 200
+
+    export_res = client.get('/api/dataset/export')
+    assert export_res.status_code == 200
+    exported = export_res.json()
+    assert exported['format_version'] == '1.0'
+    assert len(exported['quizzes']) >= 1
+
+    import_payload = {
+        'quizzes': [
+            {
+                'topic': 'Imported Algebra',
+                'learning_goal': 'Practice equations',
+                'difficulty': 6,
+                'title': 'Imported Set A',
+                'questions': [
+                    {
+                        'prompt': 'What is x if x + 4 = 9?',
+                        'options': ['2', '3', '5', '9'],
+                        'correct_option_index': 2,
+                        'category': 'algebra',
+                        'explanation': 'Subtract 4 from both sides.',
+                    }
+                ],
+                'attempts': [
+                    {
+                        'answers': [
+                            {
+                                'question_position': 1,
+                                'selected_option_index': 1,
+                                'flagged_for_review': True,
+                            }
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+    import_res = client.post('/api/dataset/import', json=import_payload)
+    assert import_res.status_code == 200
+    imported = import_res.json()
+    assert imported['imported_quizzes'] == 1
+    assert imported['imported_questions'] == 1
+    assert imported['imported_attempts'] == 1
+    assert imported['imported_answers'] == 1
+
+
+def test_historical_stats_endpoint(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    gen_start = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "machine learning", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    gen = wait_for_job(client, gen_start.json()["job_id"])
+
+    answers = [
+        {"question_id": gen["questions"][0]["id"], "selected_option_index": 1, "flagged_for_review": False},
+        {"question_id": gen["questions"][1]["id"], "selected_option_index": 2, "flagged_for_review": True},
+    ]
+    submit = client.post(f"/api/quizzes/{gen['quiz_id']}/submit", json={"answers": answers})
+    assert submit.status_code == 200
+
+    history = client.get("/api/stats/history")
+    assert history.status_code == 200
+    payload = history.json()
+
+    assert payload["global_stats"]["attempts"] >= 1
+    assert payload["global_stats"]["questions_answered"] >= 2
+    assert any(row["category"] == "ml-modeling" for row in payload["per_category_stats"])
+    assert any(missed["quiz_topic"] == "Machine Learning Fundamentals" for missed in payload["missed_questions"])
+
+
 def test_health_endpoint():
     client = TestClient(app)
     health = client.get("/api/health")
@@ -142,6 +234,9 @@ def test_health_endpoint():
 
 
 class InvalidKeyService:
+    def normalize_topic(self, topic, learning_goal=""):
+        return topic
+
     def generate_questions(self, **kwargs):
         raise QuestionGenerationError("Invalid OpenAI API key")
 

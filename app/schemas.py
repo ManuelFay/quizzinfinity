@@ -118,6 +118,120 @@ class AttemptResponse(BaseModel):
     question_results: List[QuestionResultOut]
 
 
+class MissedQuestionStatOut(BaseModel):
+    question_id: int
+    prompt: str
+    category: str
+    quiz_topic: str
+    selected_option_index: int
+    selected_option_text: str
+    correct_option_index: int
+    correct_option_text: str
+    explanation: str
+
+
+class HistoricalGlobalStatsOut(BaseModel):
+    attempts: int
+    questions_answered: int
+    correct_answers: int
+    accuracy_percentage: float
+
+
+class HistoricalCategoryStatOut(BaseModel):
+    category: str
+    correct: int
+    total: int
+    accuracy_percentage: float
+
+
+class HistoricalStatsResponse(BaseModel):
+    global_stats: HistoricalGlobalStatsOut
+    per_category_stats: List[HistoricalCategoryStatOut]
+    missed_questions: List[MissedQuestionStatOut]
+
+
+class ExportAttemptAnswerOut(BaseModel):
+    question_position: int
+    selected_option_index: int
+    is_correct: bool
+    flagged_for_review: bool
+
+
+class ExportAttemptOut(BaseModel):
+    score: int
+    total: int
+    percentage: float
+    started_at: str
+    submitted_at: str
+    answers: List[ExportAttemptAnswerOut]
+
+
+class ExportQuestionOut(BaseModel):
+    prompt: str
+    options: List[str]
+    correct_option_index: int
+    category: str
+    explanation: str
+
+
+class ExportQuizOut(BaseModel):
+    topic: str
+    learning_goal: str
+    difficulty: int
+    question_count: int
+    title: str
+    created_at: str
+    questions: List[ExportQuestionOut]
+    attempts: List[ExportAttemptOut]
+
+
+class DatasetExportResponse(BaseModel):
+    format_version: str
+    quizzes: List[ExportQuizOut]
+
+
+class ImportAttemptAnswerIn(BaseModel):
+    question_position: int = Field(ge=1)
+    selected_option_index: int = Field(ge=0, le=3)
+    is_correct: Optional[bool] = None
+    flagged_for_review: bool = False
+
+
+class ImportAttemptIn(BaseModel):
+    score: Optional[int] = None
+    total: Optional[int] = None
+    percentage: Optional[float] = None
+    answers: List[ImportAttemptAnswerIn] = Field(default_factory=list)
+
+
+class ImportQuestionIn(BaseModel):
+    prompt: str
+    options: List[str] = Field(min_length=4, max_length=4)
+    correct_option_index: int = Field(ge=0, le=3)
+    category: str
+    explanation: str
+
+
+class ImportQuizIn(BaseModel):
+    topic: str = ""
+    learning_goal: str = ""
+    difficulty: int = Field(default=9, ge=1, le=10)
+    title: str = "Imported Quiz"
+    questions: List[ImportQuestionIn] = Field(min_length=1)
+    attempts: List[ImportAttemptIn] = Field(default_factory=list)
+
+
+class DatasetImportRequest(BaseModel):
+    quizzes: List[ImportQuizIn] = Field(default_factory=list)
+
+
+class DatasetImportResponse(BaseModel):
+    imported_quizzes: int
+    imported_questions: int
+    imported_attempts: int
+    imported_answers: int
+
+
 class VerificationResult(BaseModel):
     is_valid: bool
     reasons: List[str] = Field(default_factory=list)
