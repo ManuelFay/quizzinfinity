@@ -20,6 +20,15 @@ async function parseApiResponse(res) {
   }
 }
 
+async function fetchJsonOrThrow(url, options = {}, fallbackMessage = 'Request failed') {
+  const res = await fetch(url, options);
+  const parsed = await parseApiResponse(res);
+  if (!parsed.ok || !parsed.data) {
+    throw new Error(parsed.detail || fallbackMessage);
+  }
+  return parsed.data;
+}
+
 function App() {
   const [topic, setTopic] = useState('');
   const [learningGoal, setLearningGoal] = useState('');
@@ -51,6 +60,12 @@ function App() {
     if (!quiz) return [];
     return quiz.questions.filter((q) => validated[q.id] && answers[q.id] !== q.correct_option_index);
   }, [quiz, validated, answers]);
+
+  const buildFormattedAnswers = () => quiz.questions.map((q) => ({
+    question_id: q.id,
+    selected_option_index: answers[q.id],
+    flagged_for_review: !!flags[q.id],
+  }));
 
   async function pollGenerationJob(jobId) {
     while (true) {
@@ -140,20 +155,21 @@ function App() {
   }
 
   async function submitQuiz() {
-    const formattedAnswers = quiz.questions.map((q) => ({
-      question_id: q.id,
-      selected_option_index: answers[q.id],
-      flagged_for_review: !!flags[q.id],
-    }));
-    const res = await fetch(`/api/quizzes/${quiz.quiz_id}/submit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers: formattedAnswers }),
-    });
-    const parsed = await parseApiResponse(res);
-    if (!parsed.ok || !parsed.data) return setError(parsed.detail || 'Submit failed');
-    setResult(parsed.data);
-    setStudyTopics(parsed.data.study_topics || []);
+    try {
+      const data = await fetchJsonOrThrow(
+        `/api/quizzes/${quiz.quiz_id}/submit`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ answers: buildFormattedAnswers() }),
+        },
+        'Submit failed',
+      );
+      setResult(data);
+      setStudyTopics(data.study_topics || []);
+    } catch (e) {
+      setError(e.message);
+    }
   }
 
   async function requestErrorLesson() {
@@ -161,19 +177,16 @@ function App() {
     setLessonLoading(true);
     setError('');
     try {
-      const formattedAnswers = quiz.questions.map((q) => ({
-        question_id: q.id,
-        selected_option_index: answers[q.id],
-        flagged_for_review: !!flags[q.id],
-      }));
-      const res = await fetch(`/api/quizzes/${quiz.quiz_id}/error-lesson`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ answers: formattedAnswers }),
-      });
-      const parsed = await parseApiResponse(res);
-      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to generate lesson');
-      setErrorLesson(parsed.data.lesson || 'No lesson returned.');
+      const data = await fetchJsonOrThrow(
+        `/api/quizzes/${quiz.quiz_id}/error-lesson`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ answers: buildFormattedAnswers() }),
+        },
+        'Failed to generate lesson',
+      );
+      setErrorLesson(data.lesson || 'No lesson returned.');
       setShowLessonModal(true);
     } catch (e) {
       setError(e.message);
@@ -186,10 +199,8 @@ function App() {
     setHistoryLoading(true);
     setError('');
     try {
-      const res = await fetch('/api/stats/history');
-      const parsed = await parseApiResponse(res);
-      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to load historical stats');
-      setHistoryStats(parsed.data);
+      const data = await fetchJsonOrThrow('/api/stats/history', {}, 'Failed to load historical stats');
+      setHistoryStats(data);
       setShowHistoryModal(true);
     } catch (e) {
       setError(e.message);
@@ -201,11 +212,8 @@ function App() {
   async function exportDataset() {
     setError('');
     try {
-      const res = await fetch('/api/dataset/export');
-      const parsed = await parseApiResponse(res);
-      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to export dataset');
-
-      const blob = new Blob([JSON.stringify(parsed.data, null, 2)], { type: 'application/json' });
+      const data = await fetchJsonOrThrow('/api/dataset/export', {}, 'Failed to export dataset');
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;
@@ -234,14 +242,11 @@ function App() {
     try {
       const text = await file.text();
       const payload = JSON.parse(text);
-      const res = await fetch('/api/dataset/import', {
+      const imported = await fetchJsonOrThrow('/api/dataset/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
-      const parsed = await parseApiResponse(res);
-      if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Failed to import dataset');
-      const imported = parsed.data;
+      }, 'Failed to import dataset');
       alert(`Import complete: ${imported.imported_quizzes} quizzes, ${imported.imported_questions} questions, ${imported.imported_attempts} attempts.`);
     } catch (e) {
       setError(`Import failed: ${e.message}`);
@@ -250,17 +255,23 @@ function App() {
 
   async function saveStudyPlan() {
     if (!result) return;
-    const res = await fetch(`/api/attempts/${result.attempt_id}/study-plan`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        topics: studyTopics.map((t, i) => ({ topic: t.topic, priority: i + 1 })),
-      }),
-    });
-    const parsed = await parseApiResponse(res);
-    if (!parsed.ok || !parsed.data) return setError(parsed.detail || 'Failed to save study plan');
-    setResult(parsed.data);
-    setStudyTopics(parsed.data.study_topics || []);
+    try {
+      const data = await fetchJsonOrThrow(
+        `/api/attempts/${result.attempt_id}/study-plan`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            topics: studyTopics.map((t, i) => ({ topic: t.topic, priority: i + 1 })),
+          }),
+        },
+        'Failed to save study plan',
+      );
+      setResult(data);
+      setStudyTopics(data.study_topics || []);
+    } catch (e) {
+      setError(e.message);
+    }
   }
 
   function moveTopic(i, dir) {
