@@ -1,9 +1,10 @@
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List
+from typing import Callable, List
 
 from openai import AuthenticationError, OpenAI
 
@@ -37,6 +38,7 @@ class LLMQuizService:
         weak_categories: List[str] | None = None,
         flagged_prompts: List[str] | None = None,
         prior_attempt_percentage: float | None = None,
+        custom_instructions: str = "",
     ) -> GenerationPlan:
         normalized_topic = topic.strip() or "General topic"
         normalized_goal = learning_goal.strip() or "Strengthen deep conceptual mastery"
@@ -68,6 +70,7 @@ class LLMQuizService:
 
         weak_text = ", ".join(weak_categories) if weak_categories else "none"
         flagged_text = "\n".join(f"- {x}" for x in flagged_prompts) if flagged_prompts else "- none"
+        instruction_text = custom_instructions.strip() or "none"
         prompt = (
             "Generate diagnostic multiple-choice questions and return JSON only with key 'questions'. "
             "Each question must include prompt, 4 distinct options, correct_option_index (0-3), category, explanation. "
@@ -76,7 +79,8 @@ class LLMQuizService:
             f"Difficulty (1-10): {difficulty}. "
             f"Prior weak categories to emphasize: {weak_text}. "
             "Questions explicitly flagged by learner for extra reinforcement:\n"
-            f"{flagged_text}"
+            f"{flagged_text}\n"
+            f"Additional user instructions for follow-up generation: {instruction_text}."
         )
         return GenerationPlan(prompt=prompt, difficulty=difficulty, difficulty_rationale=rationale)
 
@@ -91,6 +95,8 @@ class LLMQuizService:
         weak_categories: List[str] | None = None,
         flagged_prompts: List[str] | None = None,
         prior_attempt_percentage: float | None = None,
+        custom_instructions: str = "",
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> tuple[List[QuestionPayload], GenerationPlan]:
         if not self.client:
             raise QuestionGenerationError("OPENAI_API_KEY is required to generate quizzes")
@@ -102,23 +108,48 @@ class LLMQuizService:
             weak_categories=weak_categories,
             flagged_prompts=flagged_prompts,
             prior_attempt_percentage=prior_attempt_percentage,
+            custom_instructions=custom_instructions,
         )
 
-        prompt = (
-            f"{plan.prompt} Question count: {question_count}. "
-            "Ensure categories are meaningful and varied where possible."
-        )
         tools = [{"type": "web_search_preview"}] if use_web_search else []
+        chunk_size = 5
+        all_questions: List[QuestionPayload] = []
+        total = question_count
+        chunk_count = math.ceil(question_count / chunk_size)
 
         logger.info(
-            "Generating quiz via OpenAI (topic=%r, difficulty=%s, question_count=%s, weak_categories=%s, flagged_prompts=%s)",
+            "Generating quiz via OpenAI in %s chunks (topic=%r, difficulty=%s, question_count=%s)",
+            chunk_count,
             topic,
             plan.difficulty,
             question_count,
-            len(weak_categories or []),
-            len(flagged_prompts or []),
         )
 
+        for chunk_index in range(chunk_count):
+            remaining = total - len(all_questions)
+            request_count = min(chunk_size, remaining)
+            prompt = (
+                f"{plan.prompt} Question count: {request_count}. "
+                "Ensure categories are meaningful and varied where possible. "
+                f"Chunk {chunk_index + 1} of {chunk_count}. "
+                "Do not repeat prior prompts exactly."
+            )
+
+            response_text = self._generate_chunk_with_retry(prompt, tools)
+            payload = self._extract_json(response_text)
+            chunk_questions = [QuestionPayload(**q) for q in payload["questions"]]
+            self._validate_questions(chunk_questions)
+
+            if len(chunk_questions) > request_count:
+                chunk_questions = chunk_questions[:request_count]
+
+            all_questions.extend(chunk_questions)
+            if progress_callback:
+                progress_callback(len(all_questions), total)
+
+        return all_questions[:question_count], plan
+
+    def _generate_chunk_with_retry(self, prompt: str, tools):
         try:
             response = self.client.responses.create(model="gpt-5", input=prompt, tools=tools)
         except AuthenticationError as exc:
@@ -128,7 +159,8 @@ class LLMQuizService:
         logger.info("OpenAI generation response length=%s", len(text))
 
         try:
-            payload = self._extract_json(text)
+            self._extract_json(text)
+            return text
         except QuestionGenerationError as first_exc:
             logger.warning("Initial parse failed (%s). Retrying generation once.", first_exc)
             retry_prompt = (
@@ -137,22 +169,29 @@ class LLMQuizService:
             retry_response = self.client.responses.create(model="gpt-5", input=retry_prompt, tools=tools)
             retry_text = retry_response.output_text or ""
             logger.info("OpenAI generation retry response length=%s", len(retry_text))
-            payload = self._extract_json(retry_text)
+            return retry_text
 
-        questions = [QuestionPayload(**q) for q in payload["questions"]]
-        self._validate_questions(questions)
-        return questions, plan
-
-    def verify_questions(self, questions: List[QuestionPayload]) -> VerificationResult:
+    def verify_questions(
+        self,
+        questions: List[QuestionPayload],
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> VerificationResult:
         if not self.client:
             raise QuestionGenerationError("OPENAI_API_KEY is required to verify quizzes")
 
+        logger.info("Verifying %s generated questions", len(questions))
+        total = len(questions)
+        for i in range(total):
+            if progress_callback:
+                progress_callback(i + 1, total)
+
         verifier_prompt = (
-            "Verify this list of quiz questions. Return JSON with {is_valid:boolean,reasons:string[]}. "
-            "Check exactly 4 unique options, single valid correct index, non-empty category and explanation. "
+            "Verify this list of quiz questions for correctness, non-ambiguity, and diversity. "
+            "Return JSON with {is_valid:boolean,reasons:string[]}. "
+            "Check exactly 4 unique options, single valid correct index, non-empty category and explanation, "
+            "clear unambiguous wording, and avoid near-duplicate questions. "
             f"Questions: {json.dumps([q.model_dump() for q in questions])}"
         )
-        logger.info("Verifying %s generated questions", len(questions))
         response = self.client.responses.create(model="gpt-5", input=verifier_prompt)
         payload = self._extract_json(response.output_text or "")
         result = VerificationResult(**payload)

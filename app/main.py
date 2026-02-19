@@ -1,5 +1,8 @@
 import json
 import logging
+import threading
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -14,6 +17,8 @@ from app.schemas import (
     AttemptResponse,
     GenerateQuizRequest,
     GenerateQuizResponse,
+    QuizGenerationJobResponse,
+    QuizGenerationJobStatus,
     StudyPlanUpdateRequest,
     SubmitQuizRequest,
 )
@@ -31,24 +36,36 @@ static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
-@app.get("/")
-def root():
-    return FileResponse(static_dir / "index.html")
+@dataclass
+class GenerationJob:
+    payload: GenerateQuizRequest
+    state: str = "queued"
+    stage: str = "Queued"
+    generated_questions: int = 0
+    verified_questions: int = 0
+    total_questions: int = 0
+    error: str = ""
+    result: GenerateQuizResponse | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-@app.get("/api/health")
-def health(db: Session = Depends(get_db)):
-    db.execute(text("SELECT 1"))
-    return {"status": "ok"}
+_generation_jobs: dict[str, GenerationJob] = {}
+_generation_jobs_lock = threading.Lock()
 
 
-@app.post("/api/quizzes/generate", response_model=GenerateQuizResponse)
-def generate_quiz(payload: GenerateQuizRequest, db: Session = Depends(get_db)):
-    logger.info("Generate quiz request received (topic=%r, followup_from_attempt_id=%s, question_count=%s)", payload.topic, payload.followup_from_attempt_id, payload.question_count)
+def _track_progress(job: GenerationJob, *, stage: str, generated: int | None = None, verified: int | None = None):
+    with job.lock:
+        job.stage = stage
+        if generated is not None:
+            job.generated_questions = generated
+        if verified is not None:
+            job.verified_questions = verified
+
+
+def _resolve_followup_context(payload: GenerateQuizRequest, db: Session):
     weak_categories = []
     flagged_prompts = []
     prior_attempt_percentage = None
-    effective_difficulty = payload.difficulty
 
     if payload.followup_from_attempt_id:
         prior_topics = (
@@ -72,34 +89,14 @@ def generate_quiz(payload: GenerateQuizRequest, db: Session = Depends(get_db)):
             if flagged_ids:
                 flagged_prompts = [q.prompt for q in questions if q.id in flagged_ids]
 
-    try:
-        logger.info("Resolved follow-up context (weak_categories=%s, flagged_prompts=%s, prior_attempt_percentage=%s)", len(weak_categories), len(flagged_prompts), prior_attempt_percentage)
-        questions, plan = service.generate_questions(
-            topic=payload.topic,
-            learning_goal=payload.learning_goal,
-            difficulty=payload.difficulty,
-            question_count=payload.question_count,
-            use_web_search=payload.use_web_search,
-            weak_categories=weak_categories,
-            flagged_prompts=flagged_prompts,
-            prior_attempt_percentage=prior_attempt_percentage,
-        )
-        effective_difficulty = plan.difficulty
-        verification = service.verify_questions(questions)
-        logger.info("Quiz generated successfully with %s questions and difficulty=%s", len(questions), effective_difficulty)
-        if not verification.is_valid:
-            raise QuestionGenerationError("Verification failed: " + "; ".join(verification.reasons))
-    except QuestionGenerationError as exc:
-        detail = str(exc)
-        status = 401 if "api key" in detail.lower() else 500
-        raise HTTPException(status_code=status, detail=detail) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Quiz generation failed: {exc}") from exc
+    return weak_categories, flagged_prompts, prior_attempt_percentage
 
+
+def _persist_quiz(db: Session, payload: GenerateQuizRequest, questions, plan) -> GenerateQuizResponse:
     quiz = Quiz(
         topic=payload.topic,
         learning_goal=payload.learning_goal,
-        difficulty=effective_difficulty,
+        difficulty=plan.difficulty,
         question_count=payload.question_count,
         title=f"Diagnostic Quiz: {payload.topic or payload.learning_goal[:60]}",
     )
@@ -122,14 +119,14 @@ def generate_quiz(payload: GenerateQuizRequest, db: Session = Depends(get_db)):
     db.refresh(quiz)
 
     db_questions = db.query(Question).filter(Question.quiz_id == quiz.id).all()
-    return {
-        "quiz_id": quiz.id,
-        "title": quiz.title,
-        "difficulty": quiz.difficulty,
-        "difficulty_rationale": plan.difficulty_rationale,
-        "generation_prompt": plan.prompt,
-        "question_count": quiz.question_count,
-        "questions": [
+    return GenerateQuizResponse(
+        quiz_id=quiz.id,
+        title=quiz.title,
+        difficulty=quiz.difficulty,
+        difficulty_rationale=plan.difficulty_rationale,
+        generation_prompt=plan.prompt,
+        question_count=quiz.question_count,
+        questions=[
             {
                 "id": q.id,
                 "prompt": q.prompt,
@@ -140,7 +137,131 @@ def generate_quiz(payload: GenerateQuizRequest, db: Session = Depends(get_db)):
             }
             for q in db_questions
         ],
-    }
+    )
+
+
+def _run_generation_job(job_id: str):
+    with _generation_jobs_lock:
+        job = _generation_jobs.get(job_id)
+    if not job:
+        return
+
+    with job.lock:
+        job.state = "running"
+        job.stage = "Resolving follow-up context"
+
+    db = next(get_db())
+    try:
+        weak_categories, flagged_prompts, prior_attempt_percentage = _resolve_followup_context(job.payload, db)
+        logger.info(
+            "Resolved follow-up context (weak_categories=%s, flagged_prompts=%s, prior_attempt_percentage=%s)",
+            len(weak_categories),
+            len(flagged_prompts),
+            prior_attempt_percentage,
+        )
+
+        _track_progress(job, stage="Generating question chunks", generated=0, verified=0)
+        questions, plan = service.generate_questions(
+            topic=job.payload.topic,
+            learning_goal=job.payload.learning_goal,
+            difficulty=job.payload.difficulty,
+            question_count=job.payload.question_count,
+            use_web_search=job.payload.use_web_search,
+            weak_categories=weak_categories,
+            flagged_prompts=flagged_prompts,
+            prior_attempt_percentage=prior_attempt_percentage,
+            custom_instructions=job.payload.custom_instructions,
+            progress_callback=lambda generated, total: _track_progress(
+                job,
+                stage=f"Generating questions ({generated}/{total})",
+                generated=generated,
+            ),
+        )
+
+        _track_progress(job, stage="Verifying generated questions", verified=0)
+        verification = service.verify_questions(
+            questions,
+            progress_callback=lambda checked, total: _track_progress(
+                job,
+                stage=f"Verifying questions ({checked}/{total})",
+                verified=checked,
+            ),
+        )
+        if not verification.is_valid:
+            raise QuestionGenerationError("Verification failed: " + "; ".join(verification.reasons))
+
+        _track_progress(job, stage="Persisting quiz")
+        result = _persist_quiz(db, job.payload, questions, plan)
+
+        with job.lock:
+            job.result = result
+            job.total_questions = len(questions)
+            job.generated_questions = len(questions)
+            job.verified_questions = len(questions)
+            job.stage = "Completed"
+            job.state = "completed"
+        logger.info("Quiz generation job %s completed with %s questions", job_id, len(questions))
+    except QuestionGenerationError as exc:
+        with job.lock:
+            job.state = "failed"
+            job.error = str(exc)
+            job.stage = "Failed"
+    except Exception as exc:  # noqa: BLE001
+        with job.lock:
+            job.state = "failed"
+            job.error = f"Quiz generation failed: {exc}"
+            job.stage = "Failed"
+    finally:
+        db.close()
+
+
+@app.get("/")
+def root():
+    return FileResponse(static_dir / "index.html")
+
+
+@app.get("/api/health")
+def health(db: Session = Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    return {"status": "ok"}
+
+
+@app.post("/api/quizzes/generate", response_model=QuizGenerationJobResponse)
+def generate_quiz(payload: GenerateQuizRequest):
+    logger.info(
+        "Generate quiz request received (topic=%r, followup_from_attempt_id=%s, question_count=%s)",
+        payload.topic,
+        payload.followup_from_attempt_id,
+        payload.question_count,
+    )
+    job_id = str(uuid.uuid4())
+    job = GenerationJob(payload=payload, total_questions=payload.question_count)
+    with _generation_jobs_lock:
+        _generation_jobs[job_id] = job
+
+    thread = threading.Thread(target=_run_generation_job, args=(job_id,), daemon=True)
+    thread.start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/quizzes/generate/{job_id}", response_model=QuizGenerationJobStatus)
+def get_generation_job_status(job_id: str):
+    with _generation_jobs_lock:
+        job = _generation_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Generation job not found")
+
+    with job.lock:
+        return {
+            "job_id": job_id,
+            "state": job.state,
+            "stage": job.stage,
+            "generated_questions": job.generated_questions,
+            "verified_questions": job.verified_questions,
+            "total_questions": job.total_questions,
+            "error": job.error,
+            "result": job.result,
+        }
 
 
 @app.post("/api/quizzes/{quiz_id}/submit", response_model=AttemptResponse)

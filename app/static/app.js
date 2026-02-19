@@ -1,11 +1,4 @@
-const { useEffect, useMemo, useState } = React;
-
-const generationStages = [
-  'Analyzing your learning goal',
-  'Drafting hard diagnostic questions',
-  'Verifying quality and distractors',
-  'Finalizing quiz',
-];
+const { useMemo, useState } = React;
 
 
 async function parseApiResponse(res) {
@@ -31,34 +24,65 @@ function App() {
   const [topic, setTopic] = useState('');
   const [learningGoal, setLearningGoal] = useState('');
   const [questionCount, setQuestionCount] = useState(20);
+  const [customInstructions, setCustomInstructions] = useState('');
   const [loading, setLoading] = useState(false);
-  const [loadingStage, setLoadingStage] = useState(0);
+  const [loadingStage, setLoadingStage] = useState('Queued');
+  const [progressPct, setProgressPct] = useState(0);
   const [error, setError] = useState('');
   const [quiz, setQuiz] = useState(null);
   const [answers, setAnswers] = useState({});
   const [flags, setFlags] = useState({});
+  const [validated, setValidated] = useState({});
   const [idx, setIdx] = useState(0);
   const [result, setResult] = useState(null);
   const [studyTopics, setStudyTopics] = useState([]);
 
-  useEffect(() => {
-    if (!loading) return;
-    const id = setInterval(() => {
-      setLoadingStage((x) => Math.min(x + 1, generationStages.length - 1));
-    }, 900);
-    return () => clearInterval(id);
-  }, [loading]);
+  const missedQuestions = useMemo(() => {
+    if (!quiz) return [];
+    return quiz.questions.filter((q) => validated[q.id] && answers[q.id] !== q.correct_option_index);
+  }, [quiz, validated, answers]);
 
-  const progressPct = useMemo(() => ((loadingStage + 1) / generationStages.length) * 100, [loadingStage]);
+  async function pollGenerationJob(jobId) {
+    while (true) {
+      const statusRes = await fetch(`/api/quizzes/generate/${jobId}`);
+      const statusParsed = await parseApiResponse(statusRes);
+      if (!statusParsed.ok || !statusParsed.data) {
+        throw new Error(statusParsed.detail || 'Failed to read generation status');
+      }
+
+      const status = statusParsed.data;
+      setLoadingStage(status.stage || 'Working');
+
+      const total = status.total_questions || questionCount;
+      let pct = 5;
+      if ((status.generated_questions || 0) > 0) {
+        pct = Math.max(pct, 10 + Math.round((status.generated_questions / total) * 55));
+      }
+      if ((status.verified_questions || 0) > 0) {
+        pct = Math.max(pct, 65 + Math.round((status.verified_questions / total) * 30));
+      }
+      if (status.state === 'completed') {
+        setProgressPct(100);
+        return status.result;
+      }
+      if (status.state === 'failed') {
+        throw new Error(status.error || 'Generation failed');
+      }
+      setProgressPct(Math.min(pct, 95));
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+  }
 
   async function generateQuiz(followupFrom = null) {
     setLoading(true);
-    setLoadingStage(0);
+    setLoadingStage('Creating generation job');
+    setProgressPct(2);
     setError('');
     setResult(null);
     setQuiz(null);
     setAnswers({});
     setFlags({});
+    setValidated({});
     try {
       const res = await fetch('/api/quizzes/generate', {
         method: 'POST',
@@ -69,12 +93,16 @@ function App() {
           question_count: questionCount,
           use_web_search: true,
           followup_from_attempt_id: followupFrom,
+          custom_instructions: customInstructions,
         }),
       });
       const parsed = await parseApiResponse(res);
       if (!parsed.ok || !parsed.data) throw new Error(parsed.detail || 'Generation failed');
-      setQuiz(parsed.data);
+
+      const generatedQuiz = await pollGenerationJob(parsed.data.job_id);
+      setQuiz(generatedQuiz);
       setIdx(0);
+      setProgressPct(100);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -122,6 +150,12 @@ function App() {
     setStudyTopics(copy.map((t, rank) => ({ ...t, priority: rank + 1 })));
   }
 
+  function validateQuestion() {
+    const q = quiz.questions[idx];
+    if (answers[q.id] === undefined) return;
+    setValidated({ ...validated, [q.id]: true });
+  }
+
   if (!quiz) {
     return (
       <div className="shell">
@@ -131,6 +165,7 @@ function App() {
           {error && <div className="error-banner">{error}</div>}
           <input type="text" placeholder="Topic (e.g. Probability Theory)" value={topic} onChange={(e) => setTopic(e.target.value)} />
           <textarea rows="4" placeholder="What exactly do you want to learn? Add any preferences for easier/harder emphasis." value={learningGoal} onChange={(e) => setLearningGoal(e.target.value)} />
+          <textarea rows="3" placeholder="Custom instructions for next quiz generation (optional). These are combined with your analysis + flagged questions." value={customInstructions} onChange={(e) => setCustomInstructions(e.target.value)} />
           <div className="row">
             <label>Questions:</label>
             <input type="number" min="5" max="30" value={questionCount} onChange={(e) => setQuestionCount(Number(e.target.value))} style={{ width: '100px' }} />
@@ -139,7 +174,7 @@ function App() {
 
           {loading && (
             <div className="progress-card">
-              <div className="small">{generationStages[loadingStage]}</div>
+              <div className="small">{loadingStage}</div>
               <div className="progress-track">
                 <div className="progress-fill" style={{ width: `${progressPct}%` }} />
               </div>
@@ -153,70 +188,83 @@ function App() {
   const q = quiz.questions[idx];
   const selected = answers[q.id];
   const answered = selected !== undefined;
-  const isCorrect = answered && selected === q.correct_option_index;
-  const allAnswered = quiz.questions.every((x) => answers[x.id] !== undefined);
+  const isValidated = !!validated[q.id];
+  const isCorrect = isValidated && selected === q.correct_option_index;
+  const allValidated = quiz.questions.every((x) => validated[x.id]);
 
   return (
     <div className="shell">
-      <div className="container">
-        <h1>{quiz.title}</h1>
-        <div className="small">Difficulty: {quiz.difficulty}/10 · {quiz.difficulty_rationale}</div>
-        <div className="small">Question {idx + 1} / {quiz.questions.length}</div>
-        {error && <div className="error-banner">{error}</div>}
-        <div className="question">
-          <div className="badge">{q.category}</div>
-          <h3>{q.prompt}</h3>
-          {q.options.map((opt, i) => (
-            <label className={`option ${selected === i ? 'selected' : ''}`} key={i}>
-              <input type="radio" checked={selected === i} name={`q-${q.id}`} onChange={() => setAnswers({ ...answers, [q.id]: i })} /> {opt}
-            </label>
-          ))}
-
-          {answered && (
-            <div className={`result-card ${isCorrect ? '' : 'wrong'}`}>
-              <div><strong>{isCorrect ? 'Correct ✅' : 'Incorrect ❌'}</strong></div>
-              <div className="small">Correct answer: {q.options[q.correct_option_index]}</div>
-              <div className="small">Explanation: {q.explanation}</div>
-              <label>
-                <input type="checkbox" checked={!!flags[q.id]} onChange={(e) => setFlags({ ...flags, [q.id]: e.target.checked })} /> Need to study more
+      <div className="container layout">
+        <div className="main-panel">
+          <h1>{quiz.title}</h1>
+          <div className="small">Difficulty: {quiz.difficulty}/10 · {quiz.difficulty_rationale}</div>
+          <div className="small">Question {idx + 1} / {quiz.questions.length}</div>
+          {error && <div className="error-banner">{error}</div>}
+          <div className="question">
+            <div className="badge">{q.category}</div>
+            <h3>{q.prompt}</h3>
+            {q.options.map((opt, i) => (
+              <label className={`option ${selected === i ? 'selected' : ''}`} key={i}>
+                <input type="radio" checked={selected === i} name={`q-${q.id}`} onChange={() => setAnswers({ ...answers, [q.id]: i })} disabled={isValidated} /> {opt}
               </label>
+            ))}
+
+            {!isValidated && <button disabled={!answered} onClick={validateQuestion}>Validate answer</button>}
+            {isValidated && (
+              <div className={`result-card ${isCorrect ? '' : 'wrong'}`}>
+                <div><strong>{isCorrect ? 'Correct ✅' : 'Incorrect ❌'}</strong></div>
+                <div className="small">Correct answer: {q.options[q.correct_option_index]}</div>
+                <div className="small">Explanation: {q.explanation}</div>
+                <label>
+                  <input type="checkbox" checked={!!flags[q.id]} onChange={(e) => setFlags({ ...flags, [q.id]: e.target.checked })} /> Need to study more
+                </label>
+              </div>
+            )}
+          </div>
+          <button onClick={() => setIdx(Math.max(idx - 1, 0))} disabled={idx === 0}>Previous</button>
+          <button onClick={() => setIdx(Math.min(idx + 1, quiz.questions.length - 1))} disabled={idx === quiz.questions.length - 1}>Next</button>
+          <button onClick={submitQuiz} disabled={!allValidated}>Submit Quiz</button>
+
+          {result && (
+            <div>
+              <h2>Results: {result.score}/{result.total} ({result.percentage}%)</h2>
+              <h3>Category Summary</h3>
+              <ul>
+                {result.category_summary.map((c) => (
+                  <li key={c.category}>{c.category}: {c.correct}/{c.total} ({c.percentage}%)</li>
+                ))}
+              </ul>
+              <p><strong>Strengths:</strong> {result.strengths.join(', ') || '—'}</p>
+              <p><strong>Weaknesses:</strong> {result.weaknesses.join(', ') || '—'}</p>
+
+              <h3>Study Priorities (basis for next quiz)</h3>
+              <div className="small">Reorder and save. Follow-up prompts include your flagged questions, this analysis, and your custom instructions.</div>
+              <ul>
+                {studyTopics.map((t, i) => (
+                  <li key={`${t.topic}-${i}`}>
+                    #{i + 1} {t.topic} ({t.source})
+                    <button onClick={() => moveTopic(i, -1)}>↑</button>
+                    <button onClick={() => moveTopic(i, 1)}>↓</button>
+                  </li>
+                ))}
+              </ul>
+              <button onClick={saveStudyPlan}>Save Study Priority List</button>
+              <button onClick={() => generateQuiz(result.attempt_id)}>Generate Follow-up Quiz from Study Priorities</button>
+
+              <h3>Prompt Used for Latest Generation</h3>
+              <pre className="prompt-box">{quiz.generation_prompt}</pre>
             </div>
           )}
         </div>
-        <button onClick={() => setIdx(Math.max(idx - 1, 0))} disabled={idx === 0}>Previous</button>
-        <button onClick={() => setIdx(Math.min(idx + 1, quiz.questions.length - 1))} disabled={idx === quiz.questions.length - 1}>Next</button>
-        <button onClick={submitQuiz} disabled={!allAnswered}>Submit Quiz</button>
 
-        {result && (
-          <div>
-            <h2>Results: {result.score}/{result.total} ({result.percentage}%)</h2>
-            <h3>Category Summary</h3>
+        <aside className="side-panel">
+          <h3>Missed questions</h3>
+          {missedQuestions.length === 0 ? <div className="small">No missed questions yet.</div> : (
             <ul>
-              {result.category_summary.map((c) => (
-                <li key={c.category}>{c.category}: {c.correct}/{c.total} ({c.percentage}%)</li>
-              ))}
+              {missedQuestions.map((mq, i) => <li key={mq.id}>{i + 1}. {mq.prompt}</li>)}
             </ul>
-            <p><strong>Strengths:</strong> {result.strengths.join(', ') || '—'}</p>
-            <p><strong>Weaknesses:</strong> {result.weaknesses.join(', ') || '—'}</p>
-
-            <h3>Study Priorities (basis for next quiz)</h3>
-            <div className="small">Reorder and save. Follow-up prompts include your flagged questions plus this analysis.</div>
-            <ul>
-              {studyTopics.map((t, i) => (
-                <li key={`${t.topic}-${i}`}>
-                  #{i + 1} {t.topic} ({t.source})
-                  <button onClick={() => moveTopic(i, -1)}>↑</button>
-                  <button onClick={() => moveTopic(i, 1)}>↓</button>
-                </li>
-              ))}
-            </ul>
-            <button onClick={saveStudyPlan}>Save Study Priority List</button>
-            <button onClick={() => generateQuiz(result.attempt_id)}>Generate Follow-up Quiz from Study Priorities</button>
-
-            <h3>Prompt Used for Latest Generation</h3>
-            <pre className="prompt-box">{quiz.generation_prompt}</pre>
-          </div>
-        )}
+          )}
+        </aside>
       </div>
     </div>
   );
