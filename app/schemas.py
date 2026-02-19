@@ -31,7 +31,9 @@ class QuizQuestionOut(BaseModel):
     id: int
     prompt: str
     options: List[str]
+    main_topic: str
     category: str
+    subcategory: str
     correct_option_index: int
     explanation: str
 
@@ -89,7 +91,9 @@ class StudyPlanUpdateRequest(BaseModel):
 class QuestionResultOut(BaseModel):
     question_id: int
     prompt: str
+    main_topic: str
     category: str
+    subcategory: str
     selected_option_index: Optional[int]
     correct_option_index: int
     is_correct: Optional[bool]
@@ -170,7 +174,9 @@ class ExportQuestionOut(BaseModel):
     prompt: str
     options: List[str]
     correct_option_index: int
+    main_topic: str
     category: str
+    subcategory: str
     explanation: str
 
 
@@ -208,7 +214,9 @@ class ImportQuestionIn(BaseModel):
     prompt: str
     options: List[str] = Field(min_length=4, max_length=4)
     correct_option_index: int = Field(ge=0, le=3)
+    main_topic: str = ""
     category: str
+    subcategory: str = ""
     explanation: str
 
 

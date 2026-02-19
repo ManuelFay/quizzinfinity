@@ -36,7 +36,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(nam
 logger = logging.getLogger(__name__)
 service = LLMQuizService()
 
+def _ensure_schema_compatibility():
+    with engine.begin() as conn:
+        column_rows = conn.execute(text("PRAGMA table_info(questions)")).fetchall()
+        existing_columns = {row[1] for row in column_rows}
+        if "main_topic" not in existing_columns:
+            conn.execute(text("ALTER TABLE questions ADD COLUMN main_topic VARCHAR(255) DEFAULT ''"))
+        if "subcategory" not in existing_columns:
+            conn.execute(text("ALTER TABLE questions ADD COLUMN subcategory VARCHAR(120) DEFAULT ''"))
+
+
 Base.metadata.create_all(bind=engine)
+_ensure_schema_compatibility()
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -148,6 +159,8 @@ def _persist_quiz(db: Session, payload: GenerateQuizRequest, questions, plan) ->
                 options_json=json.dumps(q.options),
                 correct_option_index=q.correct_option_index,
                 category=q.category,
+                main_topic=payload.topic,
+                subcategory=q.category,
                 explanation=q.explanation,
             )
         )
@@ -168,7 +181,9 @@ def _persist_quiz(db: Session, payload: GenerateQuizRequest, questions, plan) ->
                 "id": q.id,
                 "prompt": q.prompt,
                 "options": json.loads(q.options_json),
-                "category": q.category,
+                "main_topic": q.main_topic or quiz.topic,
+                "category": q.subcategory or q.category,
+                "subcategory": q.subcategory or q.category,
                 "correct_option_index": q.correct_option_index,
                 "explanation": q.explanation,
             }
@@ -221,6 +236,16 @@ def _run_generation_job(job_id: str):
         )
 
         _track_progress(job, stage="Verifying generated questions", verified=0)
+        if hasattr(service, "rebalance_questions_for_option_lengths"):
+            questions = service.rebalance_questions_for_option_lengths(
+                questions,
+                progress_callback=lambda fixed, total: _track_progress(
+                    job,
+                    stage=f"Balancing option lengths ({fixed}/{total})",
+                    verified=fixed,
+                    total=total,
+                ),
+            )
         verification = service.verify_questions(
             questions,
             progress_callback=lambda checked, total: _track_progress(
@@ -426,7 +451,7 @@ def generate_error_lesson(quiz_id: int, payload: SubmitQuizRequest, db: Session 
             missed_results.append(
                 {
                     "prompt": question.prompt,
-                    "category": question.category,
+                    "category": question.subcategory or question.category,
                     "selected_option_index": answer.selected_option_index,
                     "correct_option_index": question.correct_option_index,
                     "options": json.loads(question.options_json),
@@ -468,7 +493,8 @@ def get_historical_stats(db: Session = Depends(get_db)):
         if not question:
             continue
 
-        stats = category_bucket.setdefault(question.category, {"correct": 0, "total": 0})
+        subcategory = question.subcategory or question.category
+        stats = category_bucket.setdefault(subcategory, {"correct": 0, "total": 0})
         stats["total"] += 1
         stats["correct"] += int(answer.is_correct is True)
 
@@ -489,7 +515,7 @@ def get_historical_stats(db: Session = Depends(get_db)):
             {
                 "question_id": question.id,
                 "prompt": question.prompt,
-                "category": question.category,
+                "category": subcategory,
                 "quiz_topic": (quiz.topic if quiz else "") or "General",
                 "selected_option_index": answer.selected_option_index,
                 "selected_option_text": selected_text,
@@ -580,7 +606,9 @@ def export_dataset(db: Session = Depends(get_db)):
                         "prompt": question.prompt,
                         "options": json.loads(question.options_json),
                         "correct_option_index": question.correct_option_index,
-                        "category": question.category,
+                        "main_topic": question.main_topic or quiz.topic,
+                        "category": question.subcategory or question.category,
+                        "subcategory": question.subcategory or question.category,
                         "explanation": question.explanation,
                     }
                     for question in questions
@@ -619,6 +647,8 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                 options_json=json.dumps(incoming_question.options),
                 correct_option_index=incoming_question.correct_option_index,
                 category=incoming_question.category,
+                main_topic=incoming_question.main_topic or incoming_quiz.topic,
+                subcategory=incoming_question.subcategory or incoming_question.category,
                 explanation=incoming_question.explanation,
             )
             db.add(question)

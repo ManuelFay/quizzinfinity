@@ -31,6 +31,8 @@ class Question(Base):
     options_json: Mapped[str] = mapped_column(Text)
     correct_option_index: Mapped[int] = mapped_column(Integer)
     category: Mapped[str] = mapped_column(String(120))
+    main_topic: Mapped[str] = mapped_column(String(255), default="")
+    subcategory: Mapped[str] = mapped_column(String(120), default="")
     explanation: Mapped[str] = mapped_column(Text)
 
     quiz = relationship("Quiz", back_populates="questions")

@@ -473,6 +473,48 @@ class LLMQuizService:
             logger.info("OpenAI %s retry response length=%s", schema_name, len(retry_text))
             return self._extract_json(retry_text)
 
+    @staticmethod
+    def _needs_option_length_rebalance(question: QuestionPayload) -> bool:
+        lengths = [len(option.strip()) for option in question.options if option.strip()]
+        if len(lengths) < 4:
+            return False
+        longest = max(lengths)
+        shortest = max(1, min(lengths))
+        return longest > shortest * 1.6
+
+    def rebalance_question_option_lengths(self, question: QuestionPayload) -> QuestionPayload:
+        if not self.client or not self._needs_option_length_rebalance(question):
+            return question
+
+        prompt = (
+            "Rewrite only the answer choices so all 4 options have comparable length while preserving meaning. "
+            "Return JSON with one fixed question object. Keep the same prompt, category, explanation, and correct_option_index. "
+            "You may rephrase distractors to be equally plausible and similar in length to the correct option. "
+            f"Original question: {json.dumps(question.model_dump())}"
+        )
+        payload = self._generate_json_with_retry(
+            prompt=prompt,
+            schema_name="quiz_option_rebalance",
+            schema=QUESTION_REPAIR_SCHEMA,
+        )
+        rebalanced = QuestionPayload(**payload["question"])
+        self._validate_questions([rebalanced])
+        return rebalanced
+
+    def rebalance_questions_for_option_lengths(
+        self,
+        questions: List[QuestionPayload],
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> List[QuestionPayload]:
+        total = len(questions)
+        balanced: List[QuestionPayload] = []
+        for idx, question in enumerate(questions, start=1):
+            maybe_balanced = self.rebalance_question_option_lengths(question)
+            balanced.append(maybe_balanced)
+            if progress_callback:
+                progress_callback(idx, total)
+        return balanced
+
     def verify_questions(
         self,
         questions: List[QuestionPayload],
@@ -612,7 +654,8 @@ def compute_analysis(question_rows, answer_rows):
 
     for answer in answer_rows:
         question = question_lookup[answer.question_id]
-        category = question.category
+        category = question.subcategory or question.category
+        main_topic = question.main_topic or getattr(question.quiz, "topic", "")
         by_category[category]["total"] += 1
         by_category[category]["correct"] += int(bool(answer.is_correct))
         by_category[category]["flagged"] += int(answer.flagged_for_review)
@@ -621,7 +664,9 @@ def compute_analysis(question_rows, answer_rows):
             {
                 "question_id": question.id,
                 "prompt": question.prompt,
+                "main_topic": main_topic,
                 "category": category,
+                "subcategory": category,
                 "selected_option_index": answer.selected_option_index,
                 "correct_option_index": question.correct_option_index,
                 "is_correct": answer.is_correct,
