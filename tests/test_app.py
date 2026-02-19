@@ -166,3 +166,49 @@ def test_invalid_api_key_maps_to_failed_generation_job(monkeypatch):
         time.sleep(0.02)
 
     raise AssertionError("Expected failed generation job")
+
+
+class PartialVerificationService(MockService):
+    def verify_questions(self, questions, progress_callback=None):
+        if progress_callback:
+            for i in range(len(questions)):
+                progress_callback(i + 1, len(questions))
+
+        if len(questions) == 2:
+            return VerificationResult(is_valid=False, reasons=["One question is flawed"])
+
+        prompt = questions[0].prompt.lower()
+        if "bayes theorem" in prompt or "underfit linear model" in prompt:
+            return VerificationResult(is_valid=True, reasons=[])
+        return VerificationResult(is_valid=False, reasons=["Invalid question"])
+
+    def repair_question(self, question, reasons):
+        return QuestionPayload(
+            prompt="Which change helps an underfit linear model improve?",
+            options=["Add relevant features", "Increase regularization", "Collect less data", "Lower learning rate"],
+            correct_option_index=0,
+            category=question.category,
+            explanation="Underfit models often benefit from richer relevant features.",
+        )
+
+
+def test_generation_filters_failed_questions_instead_of_failing_job(monkeypatch):
+    monkeypatch.setattr("app.main.service", PartialVerificationService())
+    client = TestClient(app)
+
+    gen_start = client.post(
+        "/api/quizzes/generate",
+        json={
+            "topic": "machine learning",
+            "learning_goal": "",
+            "question_count": 5,
+            "use_web_search": False,
+        },
+    )
+    assert gen_start.status_code == 200
+    job_id = gen_start.json()["job_id"]
+    data = wait_for_job(client, job_id)
+
+    assert len(data["questions"]) == 2
+    assert any(q["prompt"].startswith("What does Bayes theorem") for q in data["questions"])
+    assert any("underfit" in q["prompt"].lower() for q in data["questions"])

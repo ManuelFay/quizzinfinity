@@ -2,6 +2,7 @@ import json
 import logging
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -106,7 +107,7 @@ def _persist_quiz(db: Session, payload: GenerateQuizRequest, questions, plan) ->
         topic=payload.topic,
         learning_goal=payload.learning_goal,
         difficulty=plan.difficulty,
-        question_count=payload.question_count,
+        question_count=len(questions),
         title=f"Diagnostic Quiz: {payload.topic or payload.learning_goal[:60]}",
     )
     db.add(quiz)
@@ -197,17 +198,61 @@ def _run_generation_job(job_id: str):
                 verified=checked,
             ),
         )
-        if not verification.is_valid:
-            raise QuestionGenerationError("Verification failed: " + "; ".join(verification.reasons))
+        if verification.is_valid:
+            verified_questions = questions
+        else:
+            logger.warning("Batch verification reported issues; falling back to per-question filtering/repair")
+            total_questions = len(questions)
+            verified_questions = [None] * total_questions
+
+            def _verify_or_repair(idx: int, question):
+                single_result = service.verify_questions([question])
+                if single_result.is_valid:
+                    return idx, question, "verified"
+
+                repaired = service.repair_question(question, single_result.reasons)
+                if repaired:
+                    repaired_result = service.verify_questions([repaired])
+                    if repaired_result.is_valid:
+                        return idx, repaired, "repaired"
+
+                logger.warning(
+                    "Dropping question %s after verification failure: %s",
+                    idx + 1,
+                    "; ".join(single_result.reasons),
+                )
+                return idx, None, "dropped"
+
+            completed = 0
+            with ThreadPoolExecutor(max_workers=min(8, total_questions or 1)) as executor:
+                futures = [executor.submit(_verify_or_repair, idx, question) for idx, question in enumerate(questions)]
+                for future in as_completed(futures):
+                    idx, maybe_question, status = future.result()
+                    verified_questions[idx] = maybe_question
+                    completed += 1
+                    _track_progress(
+                        job,
+                        stage=f"Filtering questions ({completed}/{total_questions})",
+                        verified=completed,
+                        total=total_questions,
+                    )
+                    if status == "repaired":
+                        logger.info("Repaired question %s after verification failure", idx + 1)
+
+            verified_questions = [q for q in verified_questions if q is not None]
+            if not verified_questions:
+                raise QuestionGenerationError(
+                    "Verification failed for all questions: " + "; ".join(verification.reasons)
+                )
 
         _track_progress(job, stage="Persisting quiz")
-        result = _persist_quiz(db, job.payload, questions, plan)
+        result = _persist_quiz(db, job.payload, verified_questions, plan)
 
         with job.lock:
             job.result = result
-            job.total_questions = len(questions)
+            job.total_questions = len(verified_questions)
             job.generated_questions = len(questions)
-            job.verified_questions = len(questions)
+            job.verified_questions = len(verified_questions)
             job.stage = "Completed"
             job.state = "completed"
         logger.info("Quiz generation job %s completed with %s questions", job_id, len(questions))

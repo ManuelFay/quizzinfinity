@@ -3,6 +3,7 @@ import logging
 import math
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Callable, List
@@ -12,6 +13,101 @@ from openai import AuthenticationError, OpenAI
 from app.schemas import QuestionPayload, VerificationResult
 
 logger = logging.getLogger(__name__)
+
+
+QUESTION_LIST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                    },
+                    "correct_option_index": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "category": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "required": [
+                    "prompt",
+                    "options",
+                    "correct_option_index",
+                    "category",
+                    "explanation",
+                ],
+            },
+            "minItems": 1,
+        }
+    },
+    "required": ["questions"],
+}
+
+
+CATEGORY_PLAN_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "categories": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "focus": {"type": "string"},
+                    "question_target": {"type": "integer", "minimum": 1},
+                },
+                "required": ["name", "focus", "question_target"],
+            },
+        }
+    },
+    "required": ["categories"],
+}
+
+
+VERIFICATION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "is_valid": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["is_valid", "reasons"],
+}
+
+
+QUESTION_REPAIR_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "question": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "prompt": {"type": "string"},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                },
+                "correct_option_index": {"type": "integer", "minimum": 0, "maximum": 3},
+                "category": {"type": "string"},
+                "explanation": {"type": "string"},
+            },
+            "required": ["prompt", "options", "correct_option_index", "category", "explanation"],
+        }
+    },
+    "required": ["question"],
+}
 
 
 class QuestionGenerationError(RuntimeError):
@@ -144,32 +240,50 @@ class LLMQuizService:
         )
         logger.info("Question category plan: %s", [c.__dict__ for c in categories])
 
-        for category in categories:
-            remaining = total - len(all_questions)
+        category_requests: List[tuple[int, CategoryPlan, int]] = []
+        planned = 0
+        for idx, category in enumerate(categories):
+            remaining = total - planned
             request_count = min(category.question_target, remaining)
             if request_count <= 0:
                 break
+            planned += request_count
+            category_requests.append((idx, category, request_count))
 
-            seen_prompts = [q.prompt for q in all_questions]
+        def _generate_for_category(category: CategoryPlan, request_count: int) -> List[QuestionPayload]:
             prompt = (
                 f"{plan.prompt} "
                 f"Category focus: {category.name} ({category.focus}). "
                 f"Generate {request_count} questions for this category only. "
-                "Ensure questions are conceptually distinct and avoid overlap with each other. "
-                f"Already generated prompts to avoid repeating or paraphrasing:\n{json.dumps(seen_prompts)}"
+                "Ensure questions are conceptually distinct and avoid overlap with each other or other categories."
             )
-
-            response_text = self._generate_chunk_with_retry(prompt, tools)
-            payload = self._extract_json(response_text)
+            payload = self._generate_json_with_retry(
+                prompt=prompt,
+                schema_name="quiz_questions",
+                schema=QUESTION_LIST_SCHEMA,
+                tools=tools,
+            )
             chunk_questions = [QuestionPayload(**q) for q in payload["questions"]]
             self._validate_questions(chunk_questions)
+            return chunk_questions[:request_count]
 
-            if len(chunk_questions) > request_count:
-                chunk_questions = chunk_questions[:request_count]
+        completed_chunks: dict[int, List[QuestionPayload]] = {}
+        generated_so_far = 0
+        with ThreadPoolExecutor(max_workers=min(6, len(category_requests) or 1)) as executor:
+            futures = {
+                executor.submit(_generate_for_category, category, request_count): idx
+                for idx, category, request_count in category_requests
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                chunk_questions = future.result()
+                completed_chunks[idx] = chunk_questions
+                generated_so_far += len(chunk_questions)
+                if progress_callback:
+                    progress_callback(min(generated_so_far, total), total)
 
-            all_questions.extend(chunk_questions)
-            if progress_callback:
-                progress_callback(len(all_questions), total)
+        for idx, _, _ in category_requests:
+            all_questions.extend(completed_chunks.get(idx, []))
 
         deduped_questions = self._deduplicate_questions(all_questions)
         final_questions = deduped_questions[:question_count]
@@ -203,9 +317,12 @@ class LLMQuizService:
             f"Weak categories to cover: {weak_categories}. Flagged prompts: {flagged_prompts}. "
             f"Additional instructions: {custom_instructions or 'none'}."
         )
-        logger.info("Prompt sent to gpt-5 (planner): %s", planner_prompt)
-        response = self.client.responses.create(model="gpt-5", input=planner_prompt, tools=tools)
-        payload = self._extract_json(response.output_text or "")
+        payload = self._generate_json_with_retry(
+            prompt=planner_prompt,
+            schema_name="quiz_category_plan",
+            schema=CATEGORY_PLAN_SCHEMA,
+            tools=tools,
+        )
         raw_categories = payload.get("categories") or []
 
         categories = [
@@ -245,28 +362,51 @@ class LLMQuizService:
             idx += 1
         return categories
 
-    def _generate_chunk_with_retry(self, prompt: str, tools):
-        logger.info("Prompt sent to gpt-5 (question generation): %s", prompt)
+    def _generate_json_with_retry(self, *, prompt: str, schema_name: str, schema, tools=None):
+        logger.info("Prompt sent to gpt-5 (%s): %s", schema_name, prompt)
         try:
-            response = self.client.responses.create(model="gpt-5", input=prompt, tools=tools)
+            response = self.client.responses.create(
+                model="gpt-5",
+                input=prompt,
+                tools=tools or [],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    }
+                },
+            )
         except AuthenticationError as exc:
             raise QuestionGenerationError("Invalid OpenAI API key") from exc
 
         text = response.output_text or ""
-        logger.info("OpenAI generation response length=%s", len(text))
+        logger.info("OpenAI %s response length=%s", schema_name, len(text))
 
         try:
-            self._extract_json(text)
-            return text
+            return self._extract_json(text)
         except QuestionGenerationError as first_exc:
-            logger.warning("Initial parse failed (%s). Retrying generation once.", first_exc)
+            logger.warning("Initial parse failed for %s (%s). Retrying once.", schema_name, first_exc)
             retry_prompt = (
                 f"{prompt} IMPORTANT: Return STRICT JSON only. No markdown fences and no prose outside JSON."
             )
-            retry_response = self.client.responses.create(model="gpt-5", input=retry_prompt, tools=tools)
+            retry_response = self.client.responses.create(
+                model="gpt-5",
+                input=retry_prompt,
+                tools=tools or [],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    }
+                },
+            )
             retry_text = retry_response.output_text or ""
-            logger.info("OpenAI generation retry response length=%s", len(retry_text))
-            return retry_text
+            logger.info("OpenAI %s retry response length=%s", schema_name, len(retry_text))
+            return self._extract_json(retry_text)
 
     def verify_questions(
         self,
@@ -289,11 +429,34 @@ class LLMQuizService:
             "clear unambiguous wording, and avoid near-duplicate questions. "
             f"Questions: {json.dumps([q.model_dump() for q in questions])}"
         )
-        response = self.client.responses.create(model="gpt-5", input=verifier_prompt)
-        payload = self._extract_json(response.output_text or "")
+        payload = self._generate_json_with_retry(
+            prompt=verifier_prompt,
+            schema_name="quiz_verification",
+            schema=VERIFICATION_SCHEMA,
+        )
         result = VerificationResult(**payload)
         logger.info("Verification result: is_valid=%s reasons=%s", result.is_valid, len(result.reasons))
         return result
+
+    def repair_question(self, question: QuestionPayload, reasons: List[str]) -> QuestionPayload | None:
+        if not self.client:
+            raise QuestionGenerationError("OPENAI_API_KEY is required to repair quizzes")
+
+        repair_prompt = (
+            "Repair this multiple-choice quiz question so it is correct, unambiguous, and technically feasible. "
+            "Return one fixed question. Keep 4 unique options, a valid correct_option_index, and a clear explanation. "
+            "Preserve the core learning objective and category when possible. "
+            f"Original question: {json.dumps(question.model_dump())}. "
+            f"Verification issues to address: {json.dumps(reasons)}"
+        )
+        payload = self._generate_json_with_retry(
+            prompt=repair_prompt,
+            schema_name="quiz_question_repair",
+            schema=QUESTION_REPAIR_SCHEMA,
+        )
+        repaired = QuestionPayload(**payload["question"])
+        self._validate_questions([repaired])
+        return repaired
 
     @staticmethod
     def _extract_json(text: str):
