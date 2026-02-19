@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -79,3 +79,16 @@ class StudyTopic(Base):
     source: Mapped[str] = mapped_column(String(32), default="auto")
 
     attempt = relationship("Attempt", back_populates="study_topics")
+
+
+class QuestionHint(Base):
+    __tablename__ = "question_hints"
+    __table_args__ = (UniqueConstraint("question_id", "selected_option_index", name="uq_question_hint_variant"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("questions.id"), index=True)
+    selected_option_index: Mapped[int] = mapped_column(Integer, default=-1)
+    lesson: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    question = relationship("Question")

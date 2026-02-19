@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import Base, engine, get_db
-from app.models import Attempt, AttemptAnswer, Question, Quiz, StudyTopic
+from app.models import Attempt, AttemptAnswer, Question, QuestionHint, Quiz, StudyTopic
 from app.schemas import (
     AttemptResponse,
     DatasetExportResponse,
@@ -26,6 +26,7 @@ from app.schemas import (
     QuizGenerationJobResponse,
     ResetStatsResponse,
     QuizGenerationJobStatus,
+    QuestionHintRequest,
     StudyPlanUpdateRequest,
     SubmitQuizRequest,
 )
@@ -463,6 +464,52 @@ def submit_quiz(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(
     }
 
 
+
+
+@app.post("/api/quizzes/{quiz_id}/questions/{question_id}/hint")
+def generate_question_hint(
+    quiz_id: int,
+    question_id: int,
+    payload: QuestionHintRequest,
+    db: Session = Depends(get_db),
+):
+    question = db.query(Question).filter(Question.id == question_id, Question.quiz_id == quiz_id).first()
+    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+    if not question or not quiz:
+        raise HTTPException(status_code=404, detail="Question or quiz not found")
+
+    selected_option_index = payload.selected_option_index if payload.selected_option_index is not None else -1
+    cached_hint = (
+        db.query(QuestionHint)
+        .filter(
+            QuestionHint.question_id == question.id,
+            QuestionHint.selected_option_index == selected_option_index,
+        )
+        .first()
+    )
+    if cached_hint:
+        return {"lesson": cached_hint.lesson, "cached": True}
+
+    hint = service.generate_question_hint(
+        topic=quiz.topic,
+        learning_goal=quiz.learning_goal,
+        question={
+            "prompt": question.prompt,
+            "category": question.subcategory or question.category,
+            "options": json.loads(question.options_json),
+            "explanation": question.explanation,
+        },
+        selected_option_index=payload.selected_option_index,
+    )
+    db.add(
+        QuestionHint(
+            question_id=question.id,
+            selected_option_index=selected_option_index,
+            lesson=hint,
+        )
+    )
+    db.commit()
+    return {"lesson": hint, "cached": False}
 @app.post("/api/quizzes/{quiz_id}/error-lesson")
 def generate_error_lesson(quiz_id: int, payload: SubmitQuizRequest, db: Session = Depends(get_db)):
     questions = db.query(Question).filter(Question.quiz_id == quiz_id).all()

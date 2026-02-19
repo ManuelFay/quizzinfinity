@@ -536,13 +536,27 @@ class LLMQuizService:
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> List[QuestionPayload]:
         total = len(questions)
-        balanced: List[QuestionPayload] = []
-        for idx, question in enumerate(questions, start=1):
-            maybe_balanced = self.rebalance_question_option_lengths(question)
-            balanced.append(maybe_balanced)
-            if progress_callback:
-                progress_callback(idx, total)
-        return balanced
+        if total <= 1:
+            balanced = [self.rebalance_question_option_lengths(question) for question in questions]
+            if progress_callback and total == 1:
+                progress_callback(1, 1)
+            return balanced
+
+        balanced: List[QuestionPayload | None] = [None] * total
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(6, total)) as executor:
+            futures = {
+                executor.submit(self.rebalance_question_option_lengths, question): idx
+                for idx, question in enumerate(questions)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                balanced[idx] = future.result()
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total)
+
+        return [question for question in balanced if question is not None]
 
     def verify_questions(
         self,
@@ -595,6 +609,40 @@ class LLMQuizService:
         repaired = QuestionPayload(**payload["question"])
         self._validate_questions([repaired])
         return repaired
+
+    def generate_question_hint(
+        self,
+        *,
+        topic: str,
+        learning_goal: str,
+        question: dict,
+        selected_option_index: int | None = None,
+    ) -> str:
+        if not self.client:
+            raise QuestionGenerationError("OPENAI_API_KEY is required to generate hints")
+
+        selected_text = "none"
+        options = question.get("options") or []
+        if selected_option_index is not None and 0 <= selected_option_index < len(options):
+            selected_text = str(options[selected_option_index])
+
+        prompt = (
+            "Create a short guided hint for one quiz question. "
+            "Return JSON with {'lesson': string}. "
+            "Write in Markdown. Keep it under 180 words. "
+            "Do not reveal the final answer directly. "
+            "Use this structure: (1) ## Think First, (2) ## Step-by-Step Hint, (3) ## Quick Check. "
+            "The goal is to maximize learning transfer and help the learner reason to the answer themselves. "
+            f"Topic: {topic}. Learning goal: {learning_goal}. "
+            f"Question: {json.dumps(question)}. "
+            f"Learner's current selected option text (if any): {selected_text}."
+        )
+        payload = self._generate_json_with_retry(
+            prompt=prompt,
+            schema_name="question_hint_lesson",
+            schema=ERROR_LESSON_SCHEMA,
+        )
+        return str(payload.get("lesson", "")).strip() or "Try identifying the core concept and eliminate two distractors first."
 
     def generate_error_lesson(
         self,

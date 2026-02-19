@@ -75,6 +75,10 @@ class SubmitQuizRequest(BaseModel):
     answers: List[AnswerIn]
 
 
+class QuestionHintRequest(BaseModel):
+    selected_option_index: Optional[int] = Field(default=None, ge=0, le=3)
+
+
 class StudyTopicOut(BaseModel):
     topic: str
     priority: int

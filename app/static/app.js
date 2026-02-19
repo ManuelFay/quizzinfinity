@@ -1,4 +1,4 @@
-const { useMemo, useRef, useState } = React;
+const { useEffect, useMemo, useRef, useState } = React;
 
 
 
@@ -120,10 +120,17 @@ function App() {
   const [lessonLoading, setLessonLoading] = useState(false);
   const [errorLesson, setErrorLesson] = useState('');
   const [showLessonModal, setShowLessonModal] = useState(false);
+  const [hintLoading, setHintLoading] = useState(false);
+  const [hintLesson, setHintLesson] = useState('');
+  const [showHintModal, setShowHintModal] = useState(false);
   const [historyStats, setHistoryStats] = useState(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    document.title = "🧠 Quizzinfinity";
+  }, []);
 
   const missedQuestions = useMemo(() => {
     if (!quiz) return [];
@@ -228,6 +235,8 @@ function App() {
       setIdx(0);
       setErrorLesson('');
       setShowLessonModal(false);
+      setHintLesson('');
+      setShowHintModal(false);
       setProgressPct(100);
       setProgressMeta('Done');
     } catch (e) {
@@ -275,6 +284,31 @@ function App() {
       setError(e.message);
     } finally {
       setLessonLoading(false);
+    }
+  }
+
+
+  async function requestQuestionHint() {
+    if (!quiz) return;
+    const current = quiz.questions[idx];
+    setHintLoading(true);
+    setError('');
+    try {
+      const data = await fetchJsonOrThrow(
+        `/api/quizzes/${quiz.quiz_id}/questions/${current.id}/hint`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ selected_option_index: answers[current.id] ?? null }),
+        },
+        'Failed to generate hint',
+      );
+      setHintLesson(data.lesson || 'No hint returned.');
+      setShowHintModal(true);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setHintLoading(false);
     }
   }
 
@@ -462,6 +496,9 @@ function App() {
             ))}
 
             {!isValidated && <button disabled={!answered} onClick={validateQuestion}>Validate answer</button>}
+            <button className="hint-btn" disabled={hintLoading} onClick={requestQuestionHint}>
+              {hintLoading ? "Generating hint..." : "Need a hint?"}
+            </button>
             {isValidated && (
               <div className={`result-card ${isCorrect ? '' : 'wrong'}`}>
                 <div><strong>{isCorrect ? 'Correct ✅' : 'Incorrect ❌'}</strong></div>
@@ -556,6 +593,18 @@ function App() {
                 ))}
               </ul>
             )}
+          </div>
+        </div>
+      )}
+
+      {showHintModal && (
+        <div className="modal-overlay" onClick={() => setShowHintModal(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Learning Hint (Markdown)</h3>
+              <button className="ghost-btn" onClick={() => setShowHintModal(false)}>Close</button>
+            </div>
+            <div className="lesson-content markdown-content" dangerouslySetInnerHTML={{ __html: markdownToHtml(hintLesson) }} />
           </div>
         </div>
       )}
