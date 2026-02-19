@@ -51,6 +51,19 @@ class MockService:
                 progress_callback(i + 1, len(questions))
         return VerificationResult(is_valid=True, reasons=[])
 
+    def generate_question_hint(self, **kwargs):
+        question = kwargs.get("question") or {}
+        return f"## Think First\nFocus on {question.get('category', 'the concept')}"
+
+
+class HintCachingService(MockService):
+    def __init__(self):
+        self.calls = 0
+
+    def generate_question_hint(self, **kwargs):
+        self.calls += 1
+        return "## Think First\nUse elimination."
+
 
 def wait_for_job(client: TestClient, job_id: str):
     for _ in range(50):
@@ -311,6 +324,56 @@ def test_historical_stats_endpoint(monkeypatch):
     assert payload["global_stats"]["questions_answered"] >= 2
     assert any(row["category"] == "ml-modeling" for row in payload["per_category_stats"])
     assert any(missed["quiz_topic"] == "Machine Learning Fundamentals" for missed in payload["missed_questions"])
+
+
+
+def test_question_hint_endpoint_returns_markdown(monkeypatch):
+    monkeypatch.setattr("app.main.service", MockService())
+    client = TestClient(app)
+
+    gen_start = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "machine learning", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    gen = wait_for_job(client, gen_start.json()["job_id"])
+    question = gen["questions"][0]
+
+    hint = client.post(
+        f"/api/quizzes/{gen['quiz_id']}/questions/{question['id']}/hint",
+        json={"selected_option_index": 1},
+    )
+    assert hint.status_code == 200
+    payload = hint.json()
+    assert payload["lesson"].startswith("## Think First")
+
+
+
+def test_question_hint_endpoint_caches_by_question_and_selected_option(monkeypatch):
+    service = HintCachingService()
+    monkeypatch.setattr("app.main.service", service)
+    client = TestClient(app)
+
+    gen_start = client.post(
+        "/api/quizzes/generate",
+        json={"topic": "machine learning", "learning_goal": "", "question_count": 5, "use_web_search": False},
+    )
+    gen = wait_for_job(client, gen_start.json()["job_id"])
+    question = gen["questions"][0]
+
+    first = client.post(
+        f"/api/quizzes/{gen['quiz_id']}/questions/{question['id']}/hint",
+        json={"selected_option_index": 1},
+    )
+    assert first.status_code == 200
+    assert first.json()["cached"] is False
+
+    second = client.post(
+        f"/api/quizzes/{gen['quiz_id']}/questions/{question['id']}/hint",
+        json={"selected_option_index": 1},
+    )
+    assert second.status_code == 200
+    assert second.json()["cached"] is True
+    assert service.calls == 1
 
 
 def test_health_endpoint():
